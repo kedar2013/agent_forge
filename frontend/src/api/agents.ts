@@ -222,3 +222,34 @@ export function useDetachSubagent(agentId: string) {
     onSuccess: invalidate,
   })
 }
+
+export interface CollaboratorEntry {
+  user_email: string
+  added_by: string | null
+  created_at: string
+}
+
+export function useAgentCollaborators(agentId: string | undefined) {
+  return useQuery({
+    queryKey: [...KEY, agentId, 'collaborators'],
+    queryFn: () => api.get<CollaboratorEntry[]>(`/agents/${agentId}/collaborators`),
+    enabled: !!agentId,
+  })
+}
+
+export function useAddAgentCollaborator(agentId: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (userEmail: string) => api.post<void>(`/agents/${agentId}/collaborators`, { user_email: userEmail }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...KEY, agentId, 'collaborators'] }),
+  })
+}
+
+export function useRemoveAgentCollaborator(agentId: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (userEmail: string) =>
+      api.delete<void>(`/agents/${agentId}/collaborators/${encodeURIComponent(userEmail)}`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...KEY, agentId, 'collaborators'] }),
+  })
+}

@@ -89,6 +89,16 @@ class AttachSubagentRequest(BaseModel):
     child_agent_id: uuid.UUID
 
 
+class AddCollaboratorRequest(BaseModel):
+    user_email: str
+
+
+class CollaboratorEntry(BaseModel):
+    user_email: str
+    added_by: str | None
+    created_at: datetime
+
+
 class PublishRequest(BaseModel):
     published_by: str | None = None
 

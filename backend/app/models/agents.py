@@ -106,6 +106,26 @@ class AgentSubagent(Base):
     )
 
 
+class AgentCollaborator(Base):
+    """Author-managed sharing on top of config_api.agents._require_can_modify's
+    base rule (a developer can otherwise only modify agents THEY created).
+    Adding a row here lets a specific other developer modify this one agent
+    too, without making them its owner. Only the agent's own creator or an
+    admin can add/remove rows (see config_api/agents.py's collaborator
+    endpoints) — never a collaborator themselves, so access stays exactly as
+    the author configured it until the author (or an admin) changes it."""
+
+    __tablename__ = "agent_collaborators"
+    __table_args__ = (PrimaryKeyConstraint("agent_id", "user_email"),)
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE")
+    )
+    user_email: Mapped[str] = mapped_column(String, nullable=False)
+    added_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class AgentPublishRequest(Base):
     """A developer's request to publish an agent. Unlike an admin (who
     publishes immediately — see config_api.agents.publish_agent), a developer's

@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { FlaskConical, Rocket } from 'lucide-react'
+import { FlaskConical, Rocket, Users } from 'lucide-react'
 import { toast } from 'sonner'
 import {
+  useAddAgentCollaborator,
   useAgent,
+  useAgentCollaborators,
   useAttachSkill,
   useAttachSubagent,
   useAttachTool,
@@ -12,6 +14,7 @@ import {
   useDetachSubagent,
   useDetachTool,
   usePublishAgent,
+  useRemoveAgentCollaborator,
   useUpdateAgent,
 } from '../api/agents'
 import type { ModelConfig } from '../api/types'
@@ -20,8 +23,10 @@ import SkillAttachList from '../components/agents/SkillAttachList'
 import SkillPicker from '../components/agents/SkillPicker'
 import SubAgentAttachPanel from '../components/agents/SubAgentAttachPanel'
 import ToolAttachPanel from '../components/agents/ToolAttachPanel'
+import ManageCollaboratorsModal from '../components/collaborators/ManageCollaboratorsModal'
 import { AGENT_STATUS_TONE } from '../lib/badgeTones'
 import { fingerprint, hasPassedTest, markTesting } from '../lib/testGate'
+import { getStoredRole, getUserEmail } from '../lib/auth'
 import Badge from '../components/ui/Badge'
 import Button from '../components/ui/Button'
 import Card from '../components/ui/Card'
@@ -86,6 +91,12 @@ export default function AgentBuilderPage() {
   const attachSkill = useAttachSkill(id ?? '')
   const detachSkill = useDetachSkill(id ?? '')
   const attachSubagent = useAttachSubagent(id ?? '')
+  const [showCollaborators, setShowCollaborators] = useState(false)
+  const { data: collaborators, isLoading: collaboratorsLoading } = useAgentCollaborators(
+    showCollaborators ? id : undefined,
+  )
+  const addCollaborator = useAddAgentCollaborator(id ?? '')
+  const removeCollaborator = useRemoveAgentCollaborator(id ?? '')
   const detachSubagent = useDetachSubagent(id ?? '')
 
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT)
@@ -313,15 +324,42 @@ export default function AgentBuilderPage() {
     sub_agents: agent.sub_agents,
   })
   const canPublish = !isDirty && hasPassedTest(agent.id, currentFp)
+  // Managing WHO can collaborate is the creator's call alone (or an admin's)
+  // — matches backend config_api/agents.py's _require_is_owner, which a
+  // collaborator (granted edit access, not ownership) doesn't satisfy.
+  const canManageAccess = getStoredRole() === 'admin' || agent.created_by === getUserEmail()
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold">{agent.name}</h1>
-        <Badge tone={AGENT_STATUS_TONE[agent.status]}>
-          {agent.status} · v{agent.current_version}
-        </Badge>
+        <div className="flex items-center gap-2">
+          {canManageAccess && (
+            <Button
+              variant="outline"
+              size="sm"
+              leftIcon={<Users size={14} />}
+              onClick={() => setShowCollaborators(true)}
+            >
+              Manage access
+            </Button>
+          )}
+          <Badge tone={AGENT_STATUS_TONE[agent.status]}>
+            {agent.status} · v{agent.current_version}
+          </Badge>
+        </div>
       </div>
+
+      {showCollaborators && (
+        <ManageCollaboratorsModal
+          resourceLabel="agent"
+          collaborators={collaborators}
+          isLoading={collaboratorsLoading}
+          addMutation={addCollaborator}
+          onRemove={(email) => removeCollaborator.mutate(email)}
+          onClose={() => setShowCollaborators(false)}
+        />
+      )}
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         {/* Left: composer */}

@@ -25,6 +25,16 @@ class SkillUpdate(BaseModel):
     tags: list[str] | None = None
 
 
+class AddCollaboratorRequest(BaseModel):
+    user_email: str
+
+
+class CollaboratorEntry(BaseModel):
+    user_email: str
+    added_by: str | None
+    created_at: datetime
+
+
 class SkillRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

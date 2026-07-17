@@ -7,11 +7,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent_runtime.cache import agent_cache
 from app.db import get_db
 from app.logging_hooks import write_audit_log
-from app.models.agents import Agent, AgentPublishRequest, AgentSkill, AgentSubagent, AgentTool, AgentVersion
+from app.models.agents import (
+    Agent,
+    AgentCollaborator,
+    AgentPublishRequest,
+    AgentSkill,
+    AgentSubagent,
+    AgentTool,
+    AgentVersion,
+)
 from app.models.skills import Skill
 from app.models.tools import Tool
+from app.models.users import User
 from app.principal import Principal, require_role
 from app.schemas.agents import (
+    AddCollaboratorRequest,
     AgentCreate,
     AgentRead,
     AgentUpdate,
@@ -19,6 +29,7 @@ from app.schemas.agents import (
     AttachSkillRequest,
     AttachSubagentRequest,
     AttachToolRequest,
+    CollaboratorEntry,
     PublishRequest,
     PublishRequestRead,
     PublishResult,
@@ -31,15 +42,38 @@ def _actor(principal: Principal) -> str:
     return principal.email or f"{principal.role} (static token)"
 
 
-def _require_can_modify(agent: Agent, principal: Principal) -> None:
-    """admin can modify any agent in the workspace. A developer can only
-    modify agents THEY created — keeps one developer's edits from clobbering
-    another's, since both share admin-equivalent write access to the agent
-    tree otherwise. Routes that call this already gated entry with
-    require_role("admin", "developer"), so anything reaching here is one of
-    those two roles."""
+async def _require_can_modify(agent: Agent, principal: Principal, db: AsyncSession) -> None:
+    """admin can modify any agent in the workspace. A developer can modify
+    agents THEY created, or any agent whose creator has explicitly added
+    them as a collaborator (AgentCollaborator) — keeps one developer's
+    edits from clobbering another's by default, while still letting an
+    author deliberately share edit access with a specific colleague.
+    Routes that call this already gated entry with require_role("admin",
+    "developer"), so anything reaching here is one of those two roles."""
+    if principal.role != "developer" or agent.created_by == _actor(principal):
+        return
+    is_collaborator = await db.scalar(
+        select(AgentCollaborator).where(
+            AgentCollaborator.agent_id == agent.id,
+            AgentCollaborator.user_email == _actor(principal),
+        )
+    )
+    if is_collaborator is None:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only modify agents you created or were added to as a collaborator",
+        )
+
+
+async def _require_is_owner(agent: Agent, principal: Principal) -> None:
+    """Managing WHO can collaborate on an agent is the creator's call alone
+    (or an admin's) — a collaborator granted edit access by _require_can_modify
+    above must not be able to grant that same access to someone else without
+    the author's say-so."""
     if principal.role == "developer" and agent.created_by != _actor(principal):
-        raise HTTPException(status_code=403, detail="You can only modify agents you created")
+        raise HTTPException(
+            status_code=403, detail="Only this agent's creator can manage its collaborators"
+        )
 
 
 def _build_publish_snapshot(agent_read: AgentRead) -> dict:
@@ -281,7 +315,7 @@ async def update_agent(
     principal: Principal = Depends(require_role("admin", "developer")),
 ) -> AgentRead:
     agent = await _get_agent_or_404(db, agent_id, principal.workspace_id)
-    _require_can_modify(agent, principal)
+    await _require_can_modify(agent, principal, db)
     updates = payload.model_dump(exclude_unset=True, by_alias=False)
     model_settings = updates.pop("model_settings", None)
     if model_settings is not None:
@@ -309,7 +343,7 @@ async def archive_agent(
     principal: Principal = Depends(require_role("admin", "developer")),
 ) -> AgentRead:
     agent = await _get_agent_or_404(db, agent_id, principal.workspace_id)
-    _require_can_modify(agent, principal)
+    await _require_can_modify(agent, principal, db)
     agent.status = "archived"
     agent_cache.invalidate(agent.id)
     await write_audit_log(
@@ -332,7 +366,7 @@ async def attach_tool(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_role("admin", "developer")),
 ) -> None:
-    _require_can_modify(await _get_agent_or_404(db, agent_id, principal.workspace_id), principal)
+    await _require_can_modify(await _get_agent_or_404(db, agent_id, principal.workspace_id), principal, db)
     tool = await db.get(Tool, payload.tool_id)
     if tool is None or tool.workspace_id != principal.workspace_id:
         raise HTTPException(status_code=404, detail="Tool not found")
@@ -358,7 +392,7 @@ async def detach_tool(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_role("admin", "developer")),
 ) -> None:
-    _require_can_modify(await _get_agent_or_404(db, agent_id, principal.workspace_id), principal)
+    await _require_can_modify(await _get_agent_or_404(db, agent_id, principal.workspace_id), principal, db)
     link = await db.get(AgentTool, {"agent_id": agent_id, "tool_id": tool_id})
     if link is not None:
         await db.delete(link)
@@ -381,7 +415,7 @@ async def attach_skill(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_role("admin", "developer")),
 ) -> None:
-    _require_can_modify(await _get_agent_or_404(db, agent_id, principal.workspace_id), principal)
+    await _require_can_modify(await _get_agent_or_404(db, agent_id, principal.workspace_id), principal, db)
     skill = await db.get(Skill, payload.skill_id)
     if skill is None or skill.workspace_id != principal.workspace_id:
         raise HTTPException(status_code=404, detail="Skill not found")
@@ -411,7 +445,7 @@ async def detach_skill(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_role("admin", "developer")),
 ) -> None:
-    _require_can_modify(await _get_agent_or_404(db, agent_id, principal.workspace_id), principal)
+    await _require_can_modify(await _get_agent_or_404(db, agent_id, principal.workspace_id), principal, db)
     link = await db.get(AgentSkill, {"agent_id": agent_id, "skill_id": skill_id})
     if link is not None:
         await db.delete(link)
@@ -434,7 +468,7 @@ async def attach_subagent(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_role("admin", "developer")),
 ) -> None:
-    _require_can_modify(await _get_agent_or_404(db, agent_id, principal.workspace_id), principal)
+    await _require_can_modify(await _get_agent_or_404(db, agent_id, principal.workspace_id), principal, db)
     child = await db.get(Agent, payload.child_agent_id)
     if child is None or child.workspace_id != principal.workspace_id:
         raise HTTPException(status_code=404, detail="Sub-agent not found")
@@ -470,7 +504,7 @@ async def detach_subagent(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_role("admin", "developer")),
 ) -> None:
-    _require_can_modify(await _get_agent_or_404(db, agent_id, principal.workspace_id), principal)
+    await _require_can_modify(await _get_agent_or_404(db, agent_id, principal.workspace_id), principal, db)
     link = await db.get(
         AgentSubagent, {"parent_agent_id": agent_id, "child_agent_id": child_agent_id}
     )
@@ -544,7 +578,7 @@ async def publish_agent(
     review at /agents/publish-requests. See config_api.publish_requests for
     the approve/reject side of this."""
     agent = await _get_agent_or_404(db, agent_id, principal.workspace_id)
-    _require_can_modify(agent, principal)
+    await _require_can_modify(agent, principal, db)
     agent_read = await _assemble_agent_read(db, agent)
     snapshot = _build_publish_snapshot(agent_read)
 
@@ -670,3 +704,90 @@ async def rollback_agent(
     )
     await db.commit()
     return version_row
+
+
+# --- Collaborators: author-managed edit-access sharing ----------------------
+
+
+@router.get("/{agent_id}/collaborators", response_model=list[CollaboratorEntry])
+async def list_agent_collaborators(
+    agent_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_role("admin", "developer")),
+) -> list[AgentCollaborator]:
+    agent = await _get_agent_or_404(db, agent_id, principal.workspace_id)
+    # Visible to admin, the creator, or an existing collaborator (so someone
+    # who's been granted access can see who else has it) -- not to every
+    # other developer in the workspace.
+    if principal.role == "developer" and agent.created_by != _actor(principal):
+        await _require_can_modify(agent, principal, db)
+    result = await db.execute(
+        select(AgentCollaborator)
+        .where(AgentCollaborator.agent_id == agent_id)
+        .order_by(AgentCollaborator.created_at)
+    )
+    return list(result.scalars().all())
+
+
+@router.post("/{agent_id}/collaborators", status_code=204)
+async def add_agent_collaborator(
+    agent_id: uuid.UUID,
+    payload: AddCollaboratorRequest,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_role("admin", "developer")),
+) -> None:
+    agent = await _get_agent_or_404(db, agent_id, principal.workspace_id)
+    await _require_is_owner(agent, principal)
+
+    target = await db.scalar(
+        select(User).where(User.email == payload.user_email, User.workspace_id == principal.workspace_id)
+    )
+    if target is None:
+        raise HTTPException(status_code=404, detail="No user with that email in this workspace")
+    if target.role != "developer":
+        raise HTTPException(
+            status_code=422,
+            detail="Only a developer-role user can be added as a collaborator "
+            "(admins already have full access; other roles can't edit agents at all)",
+        )
+    if payload.user_email == agent.created_by:
+        raise HTTPException(status_code=422, detail="This agent's creator already has full access")
+
+    existing = await db.get(AgentCollaborator, {"agent_id": agent_id, "user_email": payload.user_email})
+    if existing is None:
+        db.add(AgentCollaborator(agent_id=agent_id, user_email=payload.user_email, added_by=_actor(principal)))
+        await write_audit_log(
+            db,
+            entity_type="agent",
+            entity_id=agent_id,
+            action="update",
+            actor=_actor(principal),
+            diff={"add_collaborator": payload.user_email},
+            workspace_id=principal.workspace_id,
+        )
+        await db.commit()
+
+
+@router.delete("/{agent_id}/collaborators/{user_email}", status_code=204)
+async def remove_agent_collaborator(
+    agent_id: uuid.UUID,
+    user_email: str,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_role("admin", "developer")),
+) -> None:
+    agent = await _get_agent_or_404(db, agent_id, principal.workspace_id)
+    await _require_is_owner(agent, principal)
+
+    row = await db.get(AgentCollaborator, {"agent_id": agent_id, "user_email": user_email})
+    if row is not None:
+        await db.delete(row)
+        await write_audit_log(
+            db,
+            entity_type="agent",
+            entity_id=agent_id,
+            action="update",
+            actor=_actor(principal),
+            diff={"remove_collaborator": user_email},
+            workspace_id=principal.workspace_id,
+        )
+        await db.commit()

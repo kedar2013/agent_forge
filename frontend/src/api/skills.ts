@@ -40,3 +40,34 @@ export function useDeleteSkill() {
     onSuccess: () => qc.invalidateQueries({ queryKey: KEY }),
   })
 }
+
+export interface CollaboratorEntry {
+  user_email: string
+  added_by: string | null
+  created_at: string
+}
+
+export function useSkillCollaborators(skillId: string | undefined) {
+  return useQuery({
+    queryKey: [...KEY, skillId, 'collaborators'],
+    queryFn: () => api.get<CollaboratorEntry[]>(`/skills/${skillId}/collaborators`),
+    enabled: !!skillId,
+  })
+}
+
+export function useAddSkillCollaborator(skillId: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (userEmail: string) => api.post<void>(`/skills/${skillId}/collaborators`, { user_email: userEmail }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...KEY, skillId, 'collaborators'] }),
+  })
+}
+
+export function useRemoveSkillCollaborator(skillId: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (userEmail: string) =>
+      api.delete<void>(`/skills/${skillId}/collaborators/${encodeURIComponent(userEmail)}`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...KEY, skillId, 'collaborators'] }),
+  })
+}
