@@ -1,0 +1,972 @@
+==============================================================================
+AGENT FORGE — COMPREHENSIVE DESIGN DOCUMENT
+==============================================================================
+Last updated: 2026-07-17
+
+This is the single consolidated reference for Agent Forge: why it exists,
+how every piece works, and the technical detail behind each one. It
+supersedes older split documents ("technical design document.txt",
+"component architecture and technology guide.txt", "SCIL_technical_
+document.md") for anything they disagree on — this file reflects the
+system as it stands today, including everything built/changed in the most
+recent working session (the rebrand from "Eärendil", the multi-agent
+coordination framework, the developer-role and collaborator-sharing work,
+and the Railway hosting fixes). Those older files still hold deeper
+narrative detail on some subsystems (e.g. SCIL's measured benefits,
+frontend theming) and are worth reading alongside this one, not instead
+of it.
+
+TABLE OF CONTENTS
+  1.  Philosophy and Vision
+  2.  System Architecture
+  3.  Technology Stack
+  4.  Data Model and Database Schema
+  5.  Roles, Permissions, and Ownership
+  6.  Agent Runtime
+  7.  Multi-Agent Orchestration Framework
+  8.  Tool Registry and MCP Servers
+  9.  SCIL — Self-Correcting Intelligence Layer
+  10. Domains Built on the Platform
+  11. Publish, Versioning, and Approval Workflow
+  12. Frontend Architecture
+  13. Security Model
+  14. Hosting and Deployment
+  15. Testing Philosophy
+  16. Branding
+  17. Known Limitations and Backlog
+
+==============================================================================
+1. PHILOSOPHY AND VISION
+==============================================================================
+
+Agent Forge is a UI-driven platform for composing, testing, and publishing
+AI agents (built on Google's Agent Development Kit, ADK) from Postgres-
+backed configuration — no code required to wire up a tool, attach a skill,
+or route between sub-agents. The thesis it is built to prove, concretely,
+not just in theory:
+
+  "A business team with a question shouldn't need an engineering ticket
+  to get an AI assistant that answers it safely."
+
+Three design principles follow directly from that thesis, and almost every
+architectural decision in this codebase traces back to one of them:
+
+  (a) COMPOSE, DON'T CODE. An agent is data (a Postgres row: instruction
+      text, a model choice, a list of attached tools/skills/sub-agents),
+      not a source file. Building one is filling in a form and clicking
+      attach, not writing Python. The one place actual code is still
+      required is teaching the platform a genuinely NEW capability (a new
+      tool type, a new MCP server) — after that, it is a reusable building
+      block anyone on the platform can attach to any agent, forever.
+
+  (b) GENERIC OVER ONE-OFF. A capability built for one domain must be
+      provably reusable by a second, unrelated domain before it is
+      considered "done" — not just designed to be reusable in principle.
+      This is enforced by example, not just guideline: `reporting_
+      specialist` (chart/slide/PDF/Excel export, zero domain knowledge)
+      is attached as a sub-agent to both `market_intelligence_orchestrator`
+      (finance) and `credit_facility_analyst` (credit risk) and pulls data
+      through each domain's own tools independently. `data_query_tool` is
+      schema-and-scope-driven from a `data_entities` row, not hand-written
+      per domain. The multi-specialist coordination pattern (section 7) is
+      a shared, importable module, not duplicated prompt text per
+      orchestrator.
+
+  (c) GOVERNANCE IS NOT BOLTED ON AFTERWARD. This platform is built for
+      regulated-enterprise use, where "the AI made something up" or "the
+      wrong person saw data they shouldn't have" are not acceptable
+      failure modes to discover after the fact. Concretely: every
+      config change is written to a hash-chained audit log; row-level
+      security is mechanically enforced at the database-query level
+      regardless of what an LLM-generated query says (section 5); a
+      developer's own published agents pass through an admin approval
+      queue before going live; nothing is cached or trusted until a
+      deterministic validator has checked it (section 9); and a
+      developer's Playground/testing spend comes out of their own
+      API key, not the operator's, once the platform is handling
+      real usage (section 13).
+
+Everything else in this document is the technical detail behind those
+three sentences.
+
+==============================================================================
+2. SYSTEM ARCHITECTURE
+==============================================================================
+
+Two independently deployable pieces, plus two databases:
+
+  BACKEND  — FastAPI (async) + Google ADK. Owns all business logic: agent
+             config CRUD, the ADK agent-building/caching layer, tool
+             execution, SCIL, dashboards, auth. Talks to Postgres (its own
+             config/audit/SCIL schema) and MySQL (domain business data —
+             credit facility, revenue/returns, sales analytics). Spawns
+             MCP server subprocesses on demand for `mcp_tool`-typed tools.
+
+  FRONTEND — React + TypeScript + Vite + Tailwind. Two distinct surfaces
+             sharing one codebase: an admin shell (agent building, tool/
+             skill libraries, dashboards, user management — role-gated)
+             and a separate white-labeled end-user chat surface (`/chat`)
+             with its own register/login flow. Talks to the backend only
+             over its `/api/*` REST surface — no direct DB access.
+
+  POSTGRES — schema `agent_forge`. Config of record for every agent, tool,
+             skill, policy, user, audit log row, and all SCIL state
+             (semantic cache, correction memory, entity memory, eval
+             cases/runs, groundedness samples, metrics). Requires the
+             `pgvector` extension (semantic cache + RAG retrieval both
+             embed with the same model).
+
+  MYSQL    — one server, several databases/table-prefixes: `agentic_ai`
+             (generic demo domains), `sales_analytics` (slide-reporting
+             demo), `cf_*`-prefixed tables (Credit Facility), `rr_*`-
+             prefixed tables (Revenue & Returns). Domain business data
+             lives here, never in Postgres — keeps "the platform's own
+             config" and "a domain's own data" cleanly separated.
+
+Request flow for a chat/playground/invoke turn:
+
+  1. Caller hits one of three entry points (`/api/chat/message[/stream]`,
+     `/api/playground/run`, `/api/{agent_id}/invoke`) — all three funnel
+     through the same `_run_turn`/`_stream_turn` core in
+     `playground_api/router.py`.
+  2. `agent_runtime.builder.get_or_build_agent` returns a real
+     `google.adk.agents.Agent` tree — either freshly built from the live
+     draft tables (Playground, never cached) or from a cached, frozen
+     `agent_versions.snapshot` (published agents — cache invalidated on
+     publish).
+  3. SCIL wraps the turn (section 9): template match → semantic cache
+     lookup → real ADK `Runner` call → validate → self-correct-and-retry
+     if needed → write cache/correction/metrics rows.
+  4. Every tool call passes through one shared `before_tool_callback`
+     (section 6) that injects trusted identity into RLS-scoped tools,
+     enforces the matching `access_policy`, and caps agent-to-agent
+     hand-offs per turn.
+  5. `invocation_log`/`tool_call_log` rows are written (fire-and-forget)
+     for observability/usage/audit dashboards.
+
+==============================================================================
+3. TECHNOLOGY STACK
+==============================================================================
+
+BACKEND
+  Python 3.12, FastAPI, SQLAlchemy 2.0 (async) + asyncpg, Alembic
+  (migrations), Pydantic v2 + pydantic-settings.
+  google-adk, PINNED EXACT to 2.4.0 with the `[mcp]` extra (not a >=/<
+  range — see section 14 for why: a later version silently renamed the
+  `McpToolset` symbol this app imports, and the `mcp`/`anyio` deps the
+  `[mcp]` extra pulls in are required for `McpToolset`/`MCPToolset` to
+  exist at all — google-adk's own `tools/mcp_tool/__init__.py` swallows
+  that failure in a bare `except ImportError: pass` with no visible error).
+  litellm + the official `anthropic` SDK (Claude routing via ADK's
+  `LiteLlm` adapter, and the SCIL hallucination judge, respectively).
+  pgvector (Postgres extension) + `sentence-transformers` (local
+  `all-MiniLM-L6-v2`, 384-dim) for every embedding this platform produces.
+  sqlglot (real SQL AST parsing — RLS predicate injection, SQL validator).
+  reportlab, python-pptx, openpyxl, XlsxWriter (document/slide export).
+  pymysql + DBUtils (MySQL connection pooling for domain data).
+  motor (MongoDB driver — reserved for a future Mongo-backed domain, not
+  yet used by a real domain).
+  OpenTelemetry SDK + OTLP gRPC exporter (optional distributed tracing).
+
+FRONTEND
+  React 18 + TypeScript, Vite (build/dev server), Tailwind CSS.
+  TanStack Query (server state / caching for every `api/*.ts` hook).
+  React Router (client-side routing, role-gated via a `RequireRole`
+  wrapper component).
+  Recharts (every dashboard chart). lucide-react (icons). sonner (toasts).
+
+DEPLOYMENT
+  Docker (one Dockerfile per service). Railway is the documented/tested
+  host (managed Postgres + MySQL + Volumes in one place — see section 14),
+  but both Dockerfiles work on any Docker host with persistent volumes and
+  the two databases.
+
+==============================================================================
+4. DATA MODEL AND DATABASE SCHEMA
+==============================================================================
+
+All tables below live in Postgres schema `agent_forge` unless noted.
+
+CORE CONFIG
+  workspaces          — multi-tenancy boundary; a `DEFAULT_WORKSPACE_ID`
+                         exists and is what everything currently uses in
+                         practice (full multi-tenancy hardening is listed
+                         as a backlog item, section 17).
+  users               — id, email (unique), password_hash, role (`admin`/
+                         `viewer`/`chat_user`/`developer`), workspace_id,
+                         status (`pending`/`approved`/`rejected`), soeid
+                         (optional corporate id — lets an access policy
+                         key off an external identity instead of this
+                         account's own opaque id).
+  agents              — id, name, description, base_instruction,
+                         model_config (JSONB: model string, temperature,
+                         optional `scil` sub-object — section 9), status
+                         (`draft`/`published`/`archived`), current_version,
+                         created_by (free-form string — an email for a
+                         real per-user login, or a SEED_MARKER constant
+                         for a seeded agent, or "admin (static token)" for
+                         the break-glass credential).
+  agent_versions      — one row per published version; `snapshot` is a
+                         fully self-contained JSONB blob (name,
+                         description, instruction, model_config, tools,
+                         skills, sub_agents) — what `/chat` and `/invoke`
+                         actually build from, frozen at publish time.
+  agent_tools, agent_skills, agent_subagents
+                      — plain composite-PK join tables (agent_id + the
+                         other id), `ondelete="CASCADE"` on both sides.
+  agent_publish_requests
+                      — a developer's publish attempt freezes the current
+                         live config into `snapshot` here (status=pending)
+                         instead of going live; an admin approves/rejects
+                         (section 11).
+  agent_collaborators, skill_collaborators   *** NEW this session ***
+                      — author-managed edit-access sharing (section 5).
+                         Composite PK (resource_id, user_email); `added_by`
+                         + `created_at` for audit.
+  tools               — id, name, tool_type, config (JSONB — shape is
+                         tool_type-specific, section 8), input_schema,
+                         workspace_id.
+  skills              — id, name, instruction_text, few_shot_examples
+                         (JSONB), tags, created_by.
+  access_policies      — id, resolver_config (JSONB — which identity key a
+                         policy matches against), rules (JSONB — the
+                         persona → scope predicate mapping).
+  data_entities        — a table/collection's data dictionary: columns,
+                         labels, format hints, tagged (search/filter/
+                         measure) — introspected once, editable after.
+
+OBSERVABILITY / AUDIT
+  invocation_log       — one row per agent turn (agent_id, invoked_by,
+                         status, tokens, estimated_cost_usd, latency).
+  tool_call_log        — one row per tool call within a turn (tool_id,
+                         invocation_id FK).
+  config_audit_log     — hash-chained (each row's hash includes the
+                         previous row's hash) — a config change history
+                         that cannot be silently edited after the fact
+                         without breaking the chain.
+
+SCIL (all in Postgres, section 9 has the full behavioral detail)
+  scil_semantic_cache, scil_correction_memory, scil_entity_memory,
+  scil_eval_cases, scil_eval_runs, scil_groundedness_samples, scil_metrics.
+
+DOMAIN DATA (MySQL, NOT Postgres — see section 2's rationale)
+  cf_company_master, cf_company_facility_monthly, cf_user_persona,
+  cf_user_company_coverage (Credit Facility); rr_product_master,
+  rr_revenue_returns_monthly (Revenue & Returns); the `sales_analytics`
+  schema (regions/sales_reps/categories/products/customers/orders/
+  order_items/sales_targets, slide-reporting demo).
+
+==============================================================================
+5. ROLES, PERMISSIONS, AND OWNERSHIP
+==============================================================================
+
+Four roles: `admin`, `developer`, `viewer`, `chat_user`. Every backend
+route depends on `require_role(...)` (never reads the Authorization header
+itself) so access control lives in one place (`app/principal.py`).
+
+  admin       — full access to everything: config, tools, dashboards,
+                SCIL curation, user management, direct publish, rollback.
+  developer   — builds/tests agents and sub-agents in the same Agent
+                Builder + Playground as admin, gets chat access — but:
+                  * can only MODIFY an agent/skill they created, UNLESS
+                    its creator explicitly added them as a collaborator
+                    (see below) — `_require_can_modify` in
+                    `config_api/agents.py` (and the mirrored check in
+                    `config_api/skills.py`, added this session — that
+                    file previously had NO ownership check at all, a real
+                    gap).
+                  * publishing an agent never goes live immediately — it
+                    freezes a snapshot into `agent_publish_requests`
+                    (status=pending) for an admin to approve (section 11).
+                  * CAN list/view every tool in the workspace (fixed this
+                    session — `GET /tools` previously excluded
+                    `developer`, silently 403ing the Builder's own tool-
+                    attach panel) but cannot create/edit/delete a tool.
+                  * in Playground, must supply their OWN Gemini/Anthropic
+                    API key (`X-Gemini-Api-Key`/`X-Anthropic-Api-Key`
+                    headers) — changed this session from "falls back to
+                    the operator's key" to match public chat's strict
+                    BYOK behavior, since a developer's own iteration
+                    should spend their own quota once real usage exists.
+                  * CAN see SCIL eval-suite results, run the eval suite,
+                    and see live groundedness/hallucination sampling — but
+                    only for agents THEY created (or are a collaborator
+                    on) — added this session; previously 100% admin-only.
+                  * CAN see the usage/cost dashboard, scoped to only their
+                    own agents (added this session) — the "usage by user"
+                    breakdown stays admin-only (it is about other people's
+                    activity, not their own agents' cost).
+                  * cannot: rollback a published version (bypasses the
+                    approval queue entirely — deliberately admin-only),
+                    see SCIL cache/correction/entity curation or workspace-
+                    wide cost metrics, manage users, see audit-log/
+                    monitoring dashboards, hit `/invoke` (machine-to-
+                    machine, admin-only).
+  viewer      — read-only across dashboards/config; cannot build or test.
+  chat_user   — public/end-user chat access only; no admin-shell access.
+
+OWNERSHIP AND COLLABORATOR SHARING (agent_collaborators/skill_collaborators,
+added this session)
+  The base rule is "a developer can only modify what they created." On
+  top of that, a resource's own CREATOR (or an admin) can grant a
+  SPECIFIC other developer edit access without transferring ownership —
+  `POST /agents/{id}/collaborators` / `POST /skills/{id}/collaborators`
+  (also GET to list, DELETE to revoke). Critically, managing WHO is on
+  that list is the creator's call alone: a collaborator who was granted
+  access cannot themselves add a third party — enforced server-side by a
+  separate `_require_is_owner` check, distinct from `_require_can_modify`.
+  Adding a collaborator validates the target is an existing, approved,
+  `developer`-role user in the same workspace (not an admin — redundant,
+  they already have full access; not a viewer/chat_user — they can't edit
+  agents regardless of collaborator status). Frontend: a "Manage access"
+  button appears on the Agent Builder page and the Skill edit form, but
+  ONLY to the resource's own creator or an admin.
+
+STATIC ADMIN TOKEN
+  `AGENT_FORGE_API_TOKEN` is a break-glass credential, not a per-user
+  account — it always resolves to `role=admin` in the default workspace
+  (`app/principal.py`). Used for the `/auth/login` "admin password" tab
+  and for scripts/tests.
+
+==============================================================================
+6. AGENT RUNTIME
+==============================================================================
+
+`app/agent_runtime/builder.py` is where a Postgres config row becomes a
+real `google.adk.agents.Agent` object.
+
+TWO BUILD PATHS
+  `_build_from_live_config`  — always fresh, never cached. Used by
+                                Playground, so edits are visible
+                                immediately without republishing.
+  `_build_from_snapshot`     — builds from a frozen `agent_versions.
+                                snapshot`; cached in `agent_cache` keyed
+                                by (agent_id, version), evicted on
+                                publish. Used by `/chat` and `/invoke` —
+                                the surfaces real users/systems hit.
+  Both recursively rebuild every sub-agent, re-verifying at each level
+  that a tool/skill/sub-agent actually belongs to the same workspace
+  (defense in depth beyond the entry-point check — a cross-tenant
+  reference, e.g. a legacy NULL-workspace row, can never silently end up
+  inside a built agent tree).
+
+MODEL RESOLUTION (`_resolve_model`)
+  A bare string (`"gemini-3.5-flash"`) passes straight through to ADK's
+  native Gemini path, resolving at call time to `ContextualGemini` — a
+  subclass registered for every `gemini-*` string at startup (`byok.
+  register()`, called from `app/main.py`) so BYOK/operator-key routing
+  (section 13) works without touching every call site.
+  An `"anthropic/<model-id>"` string (what the Builder's model dropdown
+  stores for every Claude option) is wrapped in ADK's `LiteLlm` adapter
+  with a shared, cached `ContextAwareLiteLLMClient` that sources its API
+  key from a per-request `ContextVar` at call time, not one frozen at
+  construction — same BYOK requirement, different fix for a different
+  provider's client architecture.
+  Default model: `gemini-3.5-flash` (migrated from `gemini-2.5-flash`
+  this session — the old model 404s on any Gemini API key/project created
+  after a certain date, "no longer available to new users", even though
+  it is nominally still a stable model for older ones). Every hardcoded
+  default (config.py, every seed script's MODEL_CONFIG, schema/dashboard
+  fallbacks, the frontend's model picker) was updated together;
+  `scripts/migrate_gemini_model.py` fixes any agent already sitting in a
+  database with the old model baked into its row.
+
+THE SHARED before_tool_callback (`_build_before_tool_callback`)
+  One callback, registered on every single agent this platform builds.
+  Three jobs, none specific to any one tool type or domain:
+  (a) TRANSFER-HOP SAFETY NET (added this session, section 7) — caps how
+      many `transfer_to_agent` calls can fire in one user turn, since
+      ADK's `transfer_to_agent` is itself just another `FunctionTool`
+      (`TransferToAgentTool extends FunctionTool`) and so already flows
+      through this exact callback like any other tool call. Keyed by
+      `tool_context.invocation_id` (unique per top-level `runner.
+      run_async()` call — needs no manual reset between turns).
+  (b) CONTEXT-PARAM INJECTION — a tool whose config lists entries under
+      `context_params` gets trusted, server-verified session-state values
+      (e.g. the caller's principal id) injected into its args before it
+      runs — never trusts the model to pass these itself.
+  (c) ROW-LEVEL SECURITY ENFORCEMENT — a tool whose config carries a
+      `policy_id` has that `AccessPolicy`'s scope predicate mechanically
+      applied (or the call denied outright) before the tool's own logic
+      ever runs. This is what makes RLS impossible for an LLM to talk its
+      way around: the enforcement point is a callback the model never
+      sees or controls, not a instruction telling it to behave.
+
+CACHING (`app/agent_runtime/cache.py`)
+  In-memory, keyed by (agent_id, version); invalidated on publish and on
+  any structural change to an ancestor (sub-agent attach/detach, tool/
+  skill attach/detach) that would otherwise leave a cached PARENT tree
+  silently serving a stale child indefinitely (a published agent's build
+  is a fully materialized tree — a parent's cache entry has children
+  baked in at build time, not keyed on the children's own version).
+
+MCP TOOLSET CLEANUP (`close_agent_toolsets`)
+  Only relevant to live (never-cached) builds: every `McpToolset` spawns
+  a real subprocess, and a fresh live build constructs a brand-new one on
+  every single call — without explicit closing after each Playground/live
+  turn, subprocesses leak (confirmed live: 124 orphaned `mcp_servers/*.py`
+  processes accumulated over one Playground testing session before this
+  fix existed).
+
+==============================================================================
+7. MULTI-AGENT ORCHESTRATION FRAMEWORK
+==============================================================================
+*** Built this session — the newest major piece of the platform. ***
+
+THE PROBLEM
+  A question can legitimately need data from more than one domain
+  specialist in a single turn ("give me the credit facility exposure for
+  Company X and the return rate for Product Y"). The original pattern
+  (built for exactly `nl2sql_orchestrator`'s two specialists) hardcoded
+  "transfer to the first relevant specialist... transfer to the second
+  relevant specialist..." directly into the orchestrator's prompt — it
+  did not generalize past two, and every future router orchestrator would
+  have needed its own hand-rolled version of the same idea.
+
+THE SOLUTION — NO NEW ORCHESTRATOR AGENT
+  The coordination happens entirely through Google ADK's existing
+  `transfer_to_agent` mechanism plus generic, reusable INSTRUCTION TEXT —
+  no new agent, no separate planning step, no scratchpad data structure
+  for "the plan". The plan IS the transfer sequence itself, visible in
+  conversation history: each specialist's "here's what I answered, here's
+  what's still needed" note, read back by the orchestrator, is the
+  coordination state.
+
+  `app/agent_runtime/orchestration_patterns.py` — the shared, reusable
+  module any router orchestrator wires up the same way:
+
+    build_router_instruction(domain_summary, specialists: dict[name, desc])
+      Generates a LOOP-UNTIL-COVERED algorithm, not "first/second" prose:
+      1. Identify every specialist domain the question touches (one, or
+         several).
+      2. Transfer to one relevant specialist not yet used for this
+         question.
+      3. It answers what it can; if the question needs data outside its
+         domain, it silently transfers BACK to the orchestrator (never
+         sideways to another specialist) with a note on what's still
+         outstanding.
+      4. Repeat step 2 for whatever remains, picking the next relevant
+         specialist not yet used — this is identical whether it's the
+         2nd, 3rd, or Nth specialist a given question ends up needing.
+      5. Never transfer to the same specialist twice for one question; if
+         everything relevant has been tried and something's still
+         outstanding, say so rather than transferring again.
+      6. Once nothing is outstanding, stop transferring and present ONE
+         combined final answer, attributing each figure to the specialist
+         it came from — never bare concatenation, never a silently
+         dropped part.
+      Adding a new specialist is one new entry in the `specialists` dict
+      passed in — nothing else about the generated instruction changes,
+      regardless of how many specialists a given question ends up
+      touching.
+
+    build_peer_clause() / strip_peer_clause(instruction)
+      The matching instruction appended to every specialist under such an
+      orchestrator: silently bounce back to your PARENT (never sideways)
+      for anything outside your own domain, never narrate the handoff
+      (concatenated across a multi-hop turn, narration would leak into
+      what the user sees). `strip_peer_clause` finds/removes it by an
+      HTML-comment marker, not exact text match, so a future wording
+      change replaces the old clause instead of stacking a second one
+      alongside it.
+
+  `seed_nl2sql_orchestrator.py` now consumes these shared builders instead
+  of its own hand-rolled instruction text; `scripts/migrate_nl2sql_
+  orchestrator_instructions.py` brought the already-seeded orchestrator +
+  specialists in line in place (not via a destructive `--reset`, which
+  would have orphaned their already-seeded `ScilEvalCase` rows).
+
+THE HARD SAFETY NET
+  The "never transfer to the same specialist twice" rule above is a
+  prompt-level instruction — a model can ignore it. The actual backstop is
+  the transfer-hop cap in `builder.py`'s shared `before_tool_callback`
+  (section 6): 8 `transfer_to_agent` calls per turn, hard cutoff, returns
+  an error forcing the model to answer with whatever it already gathered.
+  This applies to EVERY agent this platform builds automatically — not
+  configuration a new orchestrator has to opt into.
+
+VERIFIED LIVE (real Gemini calls, not mocked)
+  "Give me the credit facility exposure for Tesla Inc, and the return
+  rate for Wireless Earbuds Pro" against `nl2sql_orchestrator` correctly
+  transferred to both `credit_facility_analyst` and `revenue_returns_
+  analyst` in turn and combined both partial results into one final
+  answer with clear per-domain attribution (### 1. Credit Facility
+  Exposure... ### 2. Return Rate...).
+
+==============================================================================
+8. TOOL REGISTRY AND MCP SERVERS
+==============================================================================
+
+Every tool is a `tools` row: name, tool_type, config (JSONB, shape below),
+input_schema. `app/tool_registry/factory.py` builds the runtime object
+from that row; `app/tool_registry/base.py` defines the shared `BaseTool`/
+`ToolContext` contract every tool type implements.
+
+TOOL TYPES
+  http_tool            — arbitrary REST call (base_url/method/path
+                          template). Generic, no domain coupling.
+  mcp_tool             — binds to one named tool on an MCP server, either
+                          a remote HTTP server or a local one launched as
+                          a stdio subprocess (`command`/`args`). Every
+                          domain-specific MCP server in `backend/
+                          mcp_servers/` is reached this way: weather,
+                          mutual funds, stocks, crypto, forex/metals,
+                          company research, chart generation, slide
+                          building, document export.
+  sql_tool             — fixed, hand-written SQL against one specific
+                          table (StudyBuddy's `get_chapter_content`).
+  db_schema_tool /
+  nl2sql_query_tool    — StudyBuddy/sales_analytics-era NL→SQL pair:
+                          exposes a schema description, lets the model
+                          write arbitrary SQL against it. Domain-bound;
+                          superseded by `data_query_tool` for new domains.
+  data_query_tool      — THE generic, reusable NL2SQL primitive: schema
+                          description and access scope come from a
+                          `data_entities` row + optional `policy_id`, not
+                          hand-written code. Validates every LLM-written
+                          query through a real `sqlglot` AST (read-only,
+                          single-SELECT guardrails) and AST-injects the
+                          matching access policy's predicate — this is
+                          what `credit_facility_analyst` and `revenue_
+                          returns_analyst` are built on.
+  self_healing_sql_tool /
+  read_scratchpad_tool — the self-healing execution loop: never raises on
+                          a bad query, returns the real DB/validation
+                          error as the tool's own result so the model sees
+                          it and can rewrite the query itself next turn
+                          (capped by `max_retries`, a `tool_context.state`
+                          counter). `read_scratchpad_tool` lets a query-
+                          decomposition orchestrator read back a prior
+                          sub-query's result from a named scratchpad slot.
+  image_gen_tool       — Gemini image generation (`gemini-2.5-flash-
+                          image`, a distinct model family from the text
+                          default, not touched by the gemini-3.5-flash
+                          migration).
+  retrieval_tool       — pgvector-backed knowledge-base search (RAG),
+                          shares the platform's one embedding model
+                          (`app/embeddings.py`, 384-dim MiniLM) with SCIL's
+                          semantic cache.
+
+MCP SERVERS (backend/mcp_servers/) — each a standalone subprocess script,
+loads its own `.env` directly (not via the `app` package):
+  weather_server, mutual_fund_server, stocks_server, crypto_server,
+  forex_metals_server, chart_server (generic chart PNG from any {columns,
+  data} shape — reused by 3 market-intelligence specialists plus
+  `reporting_specialist`), slide_reporting_server (chart_planner_tool +
+  slide_builder_tool + the domain-bound nl_to_sql/sql_execution pair),
+  document_export_server (export_to_pdf/export_to_excel, generic).
+  Every generated PDF/Excel/PPTX carries a shared "Agent Forge" diagonal
+  watermark (`mcp_servers/_watermark.py`) so a file forwarded/re-uploaded
+  off-platform is still traceable back to where it came from.
+
+==============================================================================
+9. SCIL — SELF-CORRECTING INTELLIGENCE LAYER
+==============================================================================
+
+A cost/latency-reduction layer wrapped around every agent entry point
+(Playground, `/invoke`, chat blocking + streaming all funnel through the
+same `_run_turn`/`_stream_turn`), per-agent and OFF by default (absent/
+false `model_config.scil` = exact pre-SCIL behavior). Five cooperating
+pieces, all in `backend/app/scil/`:
+
+  SEMANTIC RESPONSE CACHE (scil_semantic_cache, pgvector)
+    Exact sha256 match, else cosine similarity >= `cache_similarity_
+    threshold` (default 0.80) against a validated prior answer, returns it
+    with ZERO new LLM calls. RLS domains set `"cache_scope": "user"` so a
+    cached answer is keyed by (agent, user, question) — one persona's
+    answer can never leak to a different user as a cache hit (verified
+    live). A turn with any FAILED tool call is never cached.
+
+  DETERMINISTIC VALIDATORS + SELF-CORRECTION (validators.py, corrector.py)
+    Configured validators (`sql` — sqlglot AST read-only/single-SELECT
+    guardrails; `json_schema` — the agent's own declared output_schema)
+    check every successful turn. On failure, the SAME model retries (up
+    to `max_retries`, default 2) with structured error feedback,
+    including a known-good fix from correction memory if one exists for
+    the same error class on a similar input. A recovered turn writes an
+    (input, mistake, fix) row to `scil_correction_memory`; an answer that
+    never validates still reaches the user but is NEVER cached. Error
+    signatures: SQL:Syntax, SQL:NotSingleSelect, SQL:GuardrailViolation,
+    JSON:ParseError, JSON:SchemaMismatch.
+
+  CORRECTION-EXEMPLAR INJECTION (exemplars.py)
+    Before an agent's FIRST attempt, its top-k most-similar past
+    corrections (cosine >= 0.85) are prepended to the outbound prompt as a
+    compact few-shot block — known mistakes get avoided up front, not just
+    recovered from after the fact. Only the prompt changes; the visible
+    transcript keeps the original message.
+
+  TEMPLATE-BASED DETERMINISTIC ROUTING (templates.py)
+    Per-agent regex/slot templates in `model_config.scil.templates`
+    answer a fullmatch (never a substring of a longer question) with ZERO
+    LLM calls at all (route = `deterministic`).
+
+  HALLUCINATION / GROUNDEDNESS SAMPLING (hallucination.py)
+    A configurable fraction of real successful turns (`eval_sample_rate`)
+    are scored fire-and-forget by an LLM judge against the tool-call
+    evidence actually returned — never blocks or retries the live
+    response; writes to `scil_groundedness_samples`.
+
+  EVAL FRAMEWORK (eval_runner.py + scil_eval_cases/scil_eval_runs)
+    A golden-question regression suite per agent: a real happy-path
+    lookup, a nonexistent-entity case (must refuse, not fabricate), an
+    aggregation/comparison case, etc. `POST /scil/eval/run` runs every
+    active case for an agent's PUBLISHED version right now, grades each
+    with an LLM judge, groups results under one `batch_id`.
+
+METRICS + ADMIN SURFACE
+  Every turn writes one `scil_metrics` row (route = disabled/
+  deterministic/cache_hit/llm/llm_retry). The SCIL Dashboard (`/scil`)
+  shows LLM calls avoided, cache hit rate, retry success rate, route
+  distribution, savings over time, plus curation tables. A DEVELOPER sees
+  only the Evals tab, scoped to agents they created (section 5) — Cache/
+  Corrections/Overview metrics stay admin-only.
+
+CONFIG SHAPE (per agent, in model_config.scil)
+  { "enabled": true, "cache_similarity_threshold": 0.80,
+    "cache_ttl_hours": 24, "max_retries": 2, "validators": ["sql"],
+    "templates_enabled": true, "templates": [...],
+    "cache_scope": "user" (RLS domains only),
+    "eval_sample_rate": 0.0-1.0, "hallucination_groundedness_check": bool }
+
+DELIBERATELY NOT ENABLED on the StudyBuddy family (session-state-scoped
+retrieval the user dimension doesn't fully carry; quiz/flashcard output
+is supposed to vary between runs, so caching would be actively wrong).
+
+Not yet built: escalation-tier routing to a bigger model, HITL escalation.
+
+==============================================================================
+10. DOMAINS BUILT ON THE PLATFORM
+==============================================================================
+
+Each domain below is a proof point for the "generic, not one-off" thesis
+(section 1) — later ones increasingly reuse infrastructure the earlier
+ones needed to build.
+
+  STUDYBUDDY  — 7 sub-agents + orchestrator, ported verbatim (instructions,
+                tools, output schemas) from a sibling project. Uses
+                retrieval_tool (RAG) + sql_tool + image_gen_tool. SCIL
+                deliberately off (see section 9).
+
+  MARKET INTELLIGENCE — 3 specialists (stock_market_analyst, crypto_
+                analyst, forex_metals_analyst) + market_intelligence_
+                orchestrator, all on free/no-key public data sources
+                (Yahoo Finance, CoinGecko, frankfurter.app, gold-api.com).
+                Its orchestrator uses a simpler, deliberately different
+                "pick exactly one specialist, ask the user to follow up
+                for the rest" design (not the loop-until-covered pattern
+                in section 7) — a considered choice for this orchestrator
+                specifically, not something the multi-specialist framework
+                overrides. `slide_reporting_agent` and `reporting_
+                specialist` are attached as further sub-agents.
+
+  CREDIT FACILITY ANALYSIS — first worked example of the generic RLS
+                framework (access_policies + data_entities +
+                data_query_tool), zero domain-specific code. Row-level
+                access varies by persona: GCM (global), GSG (no L2
+                visibility), Non-GSG (assigned companies only), CCB
+                (exact gfcid reference only) — resolved from the caller's
+                Agent Forge account or their SOEID. Model: Claude Haiku
+                4.5 (switched from Gemini at some point as a practical
+                workaround, independent of the gemini-3.5-flash migration).
+
+  REVENUE AND RETURNS ANALYSIS — second worked example on the same
+                generic pieces, deliberately WITHOUT access_policies
+                (every user sees all data) — proves the data_entities +
+                data_query_tool pattern isn't RLS-dependent. 3-level
+                product hierarchy, 6 months of revenue/returns/refund
+                data. Also the base domain for two agentic-SQL-pattern
+                demo agents: `self_healing_revenue_analyst` (the retry
+                loop in isolation) and `revenue_query_orchestrator` +
+                `revenue_query_synthesizer` (query decomposition: split a
+                compound question into up to 3 independent sub-queries,
+                run each through the same self-healing tool, synthesize).
+
+  SALES ANALYTICS — the worked example for the self-service domain-
+                onboarding wizard (`/onboarding/new-domain`): pick a
+                connection, pick a table, columns auto-introspected/
+                labeled/tagged, one click creates every data_query_tool,
+                publish gated behind a smoke test requiring at least one
+                real tool call.
+
+  NL2SQL ORCHESTRATOR — the single entry point across every structured-
+                data domain (currently: Credit Facility, Revenue &
+                Returns), built entirely on the section-7 coordination
+                framework — the concrete proof that pattern actually
+                works for real, unrelated domains, not just in theory.
+
+  REPORTING SPECIALIST — chart + slide + PDF/Excel export, zero domain
+                knowledge, attached as a sub-agent to BOTH market_
+                intelligence_orchestrator and credit_facility_analyst —
+                the concrete proof of cross-domain tool/agent reuse
+                (section 1's principle (b)).
+
+==============================================================================
+11. PUBLISH, VERSIONING, AND APPROVAL WORKFLOW
+==============================================================================
+
+  DRAFT   — the live, editable config. Playground always builds fresh
+            from here (never cached), so iteration is immediate.
+  TEST GATE — publish is disabled in the UI until a Playground run has
+            succeeded against the EXACT current config (a fingerprint of
+            the draft is compared against what was last tested) — an
+            agent that "answers" without ever being run isn't provably
+            working yet.
+  PUBLISH — admin: goes live immediately, freezing a new `agent_versions`
+            row and bumping `current_version`; any published ANCESTOR
+            orchestrator is also cache-invalidated (its materialized tree
+            would otherwise keep serving the stale child).
+            developer: freezes the current config into an `agent_publish_
+            requests` row (status=pending) instead — an admin reviews at
+            `/agents/publish-requests` and approves (publishes exactly
+            that frozen snapshot, not whatever the draft has drifted to
+            by review time) or rejects.
+  ROLLBACK — admin-only, deliberately: restores the live draft to look
+            like an older published version, then republishes that as a
+            BRAND-NEW version (history is never overwritten or deleted).
+            Not available to developers — it republishes immediately with
+            no review step, which would be a way around the approval
+            queue entirely.
+
+==============================================================================
+12. FRONTEND ARCHITECTURE
+==============================================================================
+
+Two surfaces, one codebase:
+
+  ADMIN SHELL (Layout.tsx + role-gated routes in App.tsx via a
+  `RequireRole` wrapper) — Agent Builder, Tools/Skills libraries,
+  Playground, SCIL Dashboard, Usage/Monitoring/Audit dashboards, Debug
+  Console, user management, the domain-onboarding wizard. Auth: the
+  static admin token or a named admin/developer/viewer login
+  (`af_admin_token`/`af_admin_role` in localStorage).
+
+  PUBLIC CHAT (`/chat`) — its own register/login flow
+  (`af_user_token`/`af_user_email`), a separate white-labeled surface.
+  BYOK is enforced here strictly (section 13): a `MissingApiKeyError`
+  (backend `400`, `{"error": "missing_api_key", "provider": ...}`) opens
+  an `ApiKeyPrompt` modal instead of a generic error bubble, storing the
+  key in sessionStorage only (`af_byok_gemini`/`af_byok_anthropic`) and
+  resending the same message once supplied.
+
+  PLAYGROUND — as of this session, uses the SAME BYOK mechanism as public
+  chat (previously it had none at all): `api/playground.ts` now goes
+  through the shared `parseError`/`providerKeyHeaders` helpers from
+  `api/chat.ts` rather than the generic `api` client, and `Playground
+  Chat.tsx` opens the same `ApiKeyPrompt` modal on a missing-key error,
+  retrying the same message once a key is supplied (skipping a duplicate
+  user-turn bubble on retry).
+
+  KEY PATTERNS
+    Every `api/*.ts` file wraps TanStack Query hooks around one resource
+    (`useAgents`, `useSkills`, `useScilSummary`, ...); mutation hooks
+    invalidate the relevant query key on success.
+    Role-scoped UI: several dashboards (Usage, SCIL) render a DIFFERENT
+    view for a developer than an admin — not by hiding a broken feature,
+    but by passing an `enabled: false` flag into the underlying query so
+    the still-admin-only endpoint is never even called, and adjusting
+    which sections/tabs render at all (e.g. ScilDashboardPage shows only
+    the Evals tab to a developer, forcing `tab` to that value and hiding
+    the tab switcher rather than showing one dead option).
+    Shared component reuse for the collaborator feature: the SAME
+    `EvalsTab` (SCIL) and `ManageCollaboratorsModal` components are reused
+    verbatim across contexts, with role/ownership filtering applied at
+    the data layer (which agents show in a picker) rather than forking
+    the component.
+
+==============================================================================
+13. SECURITY MODEL
+==============================================================================
+
+  BYOK (BRING YOUR OWN KEY) — `app/agent_runtime/byok.py`'s
+  `resolve_request_api_keys(..., allow_operator_fallback: bool)` is the
+  ONE place that decides whether the operator's own `.env` key may be
+  used as a fallback:
+    - Public chat (`/chat/message[/stream]`): `allow_operator_fallback=
+      False`, always — a visitor must supply their own key; the
+      operator's own quota is never spent on public traffic.
+    - Playground (`/playground/run`): conditional on caller role —
+      `True` for admin (internal tooling), `False` for developer (their
+      own iteration should spend their own quota, changed this session).
+    - `/invoke` (admin-only, machine-to-machine): `True` — not public
+      traffic, no role branch needed.
+  A supplied header always takes priority over the operator fallback
+  regardless of role.
+
+  ROW-LEVEL SECURITY — see section 6(c). Enforced by a callback the model
+  never sees or controls, not by an instruction telling it to behave.
+
+  AUDIT LOGGING — `config_audit_log` is hash-chained (each row's hash
+  includes the previous row's), making silent post-hoc edits detectable.
+  Every config-mutating endpoint writes a row via `write_audit_log`.
+
+  SECRETS — `backend/.env` is local-development only; every value in it
+  (and anything that's appeared in an AI coding session's tool output)
+  must be treated as already compromised before any hosted deploy.
+  `app/config.py`'s Settings validator enforces part of this
+  automatically once `ENV != development`: refuses to boot if `USER_
+  TOKEN_SECRET`/`AGENT_FORGE_API_TOKEN` are missing/placeholder/under 32
+  chars, or if `CORS_ORIGINS` still contains a localhost entry. See
+  `backend/SECURITY.md` for the full rotation checklist (which values can
+  be rotated by generating a new random string vs. which require the
+  provider's own console — Gemini/Anthropic API keys are provider-issued
+  and cannot be revoked from within this repo).
+
+  DATA RETENTION — `POST /api/data-retention/purge` (admin-only, dry-run
+  by default) deletes conversation/PII-bearing data older than
+  `DATA_RETENTION_DAYS` (default 90) for the caller's workspace. Nothing
+  calls this automatically — this app has no scheduler; run it by hand or
+  point a hosting provider's own cron feature at it.
+
+  GENERATED-FILE ACCESS — `/generated-images/{filename}` and
+  `/generated-files/{filename}` are gated by a signed, expiring token
+  query param (same shape as an S3/GCS pre-signed URL), not a plain
+  static-file mount — these directories can hold real business/financial
+  data (exported PDFs/PPTX with real numbers), so unauthenticated
+  directory listing/guessing must not work.
+
+  UNHANDLED-EXCEPTION HANDLING — a catch-all exception handler logs the
+  full traceback server-side but returns a generic message to the caller;
+  an unhandled exception's raw `str()` can leak internal details (file
+  paths, query fragments, library internals) that have no business
+  reaching an external client.
+
+==============================================================================
+14. HOSTING AND DEPLOYMENT
+==============================================================================
+
+Railway is the documented/tested host: two services (backend, frontend)
++ managed Postgres (with pgvector) + managed MySQL + a persistent Volume
+for `generated_files`/`generated_images`. Full step-by-step in
+`HOSTING.md`. The backend MUST run as a single instance (not horizontally
+scaled) — `app/rate_limit.py`'s hit counter and the Playground's
+`InMemorySessionService` are both explicitly single-instance-only.
+
+GOTCHAS ACTUALLY HIT AND FIXED THIS SESSION (all now handled in code, not
+just documented as "remember to configure this"):
+
+  DATABASE_URL DRIVER MISMATCH — Railway's (and Heroku's) managed-Postgres
+  connection string is plain `postgres://`/`postgresql://` with no
+  driver, which SQLAlchemy resolves to the sync `psycopg2` dialect — not
+  installed here, since this app's engine is async-only via `asyncpg`.
+  Fixed with a Pydantic field_validator on `Settings.database_url` that
+  rewrites the scheme to `postgresql+asyncpg://` regardless of what the
+  host hands over — no manual env-var editing required on any host.
+
+  google-adk's [mcp] EXTRA — see section 3's technology-stack entry. A
+  bare `google-adk==2.4.0` install (no extra) leaves `McpToolset`
+  silently undefined; `google-adk[mcp]==2.4.0` is required.
+
+  FRONTEND PORT BINDING — Caddy (serving the frontend's static build) was
+  hardcoded to listen on `:80`, but Railway injects a dynamic `$PORT` the
+  container must actually listen on. Fixed: `:{$PORT:80}` in the
+  Caddyfile — uses Railway's `$PORT` when present, falls back to 80 for
+  local `docker-compose` (which has no `$PORT` set and expects 80).
+
+  CORS_ORIGINS MISMATCH — a 400 on an OPTIONS preflight request is
+  Starlette's CORSMiddleware itself rejecting an origin not in the
+  allow-list (`Disallowed CORS origin`, a real response body/status this
+  middleware produces, not a bug) — `CORS_ORIGINS` must exactly match the
+  frontend's real origin (scheme + host, no trailing slash), set on the
+  BACKEND service, and the backend redeployed after any change.
+
+SEED/MIGRATION SCRIPT CONVENTIONS (backend/scripts/, backend/app/domains/
+*/seed_*.py) — every one of these follows the same shape:
+  - Idempotent: safe to re-run; a "create if missing" script no-ops if
+    its target already exists (prints and returns, doesn't error).
+  - `--reset` undoes ONLY what that specific script created (identified
+    by a `SEED_MARKER`/`created_by` constant), never touches anything
+    else, including hand-built config from the admin UI.
+  - A "migration" script (`migrate_gemini_model.py`, `migrate_nl2sql_
+    orchestrator_instructions.py`) is a DIFFERENT shape from a seed
+    script: it updates rows ALREADY in the database in place (and
+    republishes them, since `/chat`/`/invoke` build from the published
+    snapshot, not the live draft — editing the draft alone is invisible
+    to real traffic) rather than deleting and recreating, specifically to
+    avoid orphaning other data that references the existing row's id
+    (e.g. deleting and recreating an orchestrator would orphan its
+    already-seeded `ScilEvalCase` rows).
+  - Running a script against a HOSTED database: `railway run <cmd>`
+    executes locally with Railway's env vars injected (needs the local
+    machine to reach the hosted DB over the network) — this is how every
+    hosted seed/migration in this project's history has actually been
+    run, not via a Railway dashboard shell.
+
+==============================================================================
+15. TESTING PHILOSOPHY
+==============================================================================
+
+  `cd backend && python -m pytest` runs against the REAL local Postgres
+  `agent_forge` schema — no mocked DB. Two kinds of real external calls:
+  hermetic ones via `httpx.MockTransport` for HTTP-tool unit tests, and a
+  genuinely live call in `test_playground.py` (real Gemini + real ADK +
+  a real HTTP GET) that proves the full stack actually works end to end,
+  not just that each piece works in isolation.
+
+  KNOWN CHARACTERISTIC, NOT A BUG: tests create rows with random-suffix
+  names (a `unique_name()` fixture — `agent_a1b2c3d4`, `dev_a1b2c3d4@
+  example.com`, etc.) directly in that real database and do not clean up
+  after themselves — repeated test runs accumulate this data over time
+  (154 test agents / 12 tools / 24 skills / 21 users were found and
+  removed in a cleanup pass this session, using exactly this naming
+  pattern to identify what was safe to delete without touching any real/
+  seeded row). Running the suite again will start accumulating a fresh
+  batch the same way — periodic cleanup (or a proper test-DB-isolation
+  fix, not yet built) is expected, not a sign something is broken.
+
+  Deletion order for a manual cleanup matters: `agents`/`tools` are
+  referenced (with NO cascade) by `invocation_log`, `tool_call_log`, and
+  every SCIL table (`scil_semantic_cache`, `scil_correction_memory`,
+  `scil_entity_memory`, `scil_eval_runs`, `scil_eval_cases`, `scil_
+  groundedness_samples`) — those must be deleted first, or the delete
+  fails on a foreign-key violation. `agent_tools`/`agent_skills`/`agent_
+  subagents`/`agent_versions` DO cascade on their parent agent's deletion.
+
+==============================================================================
+16. BRANDING
+==============================================================================
+
+The platform's name is Agent Forge — renamed from "Eärendil" this
+session. The prior name (a character from Tolkien's legendarium) carried
+real trademark/unfair-competition exposure for a publicly deployed
+product brand (page title, meta author "Kedar's Eärendil Studio", logo,
+homepage copy) — Middle-earth Enterprises/the Tolkien Estate has a
+documented history of enforcing against unrelated commercial uses of
+Tolkien names. "Agent Forge" was already the project's internal/technical
+name (the Python package name, the GitHub repo, `AGENT_FORGE_API_TOKEN`)
+before the rebrand, so the change was a rename to something already true
+of the codebase, not an invented new identity. No agent's actual LLM-
+facing instruction text ever referenced the old name, so the rebrand was
+a code/asset-only change — nothing already seeded in any database needed
+a data-level fix.
+
+==============================================================================
+17. KNOWN LIMITATIONS AND BACKLOG
+==============================================================================
+
+Deliberately not built yet, in the maintainers' own words at the time
+each was deferred:
+
+  - SCIL escalation-tier routing to a bigger model, and HITL escalation.
+  - Real OpenTelemetry export wired to a production trace backend
+    (Jaeger works locally via `docker compose up -d jaeger`; Langfuse/
+    Tempo/Honeycomb/Datadog are all OTLP-compatible but untested here).
+  - A versioning diff/rollback UI beyond the raw version list.
+  - Per-agent rate limiting beyond what `app/rate_limit.py` already
+    enforces.
+  - Multi-tenancy hardening beyond the single default workspace every
+    piece of this platform currently assumes in practice.
+  - Live retrieval/pgvector testing outside the StudyBuddy import.
+  - Market-news sentiment agents (no reliable free/no-key news API was
+    available when Market Intelligence was built).
+  - Test-database isolation — the test suite runs against the real local
+    dev database with no per-test rollback or separate test DB (section
+    15); this is a known, documented tradeoff, not an oversight, but a
+    real fix is still on the table if the accumulation becomes too
+    disruptive to work around with periodic manual cleanup.
+  - The two-user-role `mutual fund research`/`fund_analyst_agent`/
+    `company_research_copilot` agents that exist only because they were
+    hand-built via the admin UI on one particular local instance have no
+    seed script — they cannot be reproduced on a fresh environment (e.g.
+    a new hosted deploy) without manually rebuilding them in the Agent
+    Builder, or writing one.
