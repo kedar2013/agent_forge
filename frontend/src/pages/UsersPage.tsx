@@ -103,7 +103,7 @@ export default function UsersPage() {
       {!isLoading && decided.length > 0 && (
         <div>
           <h2 className="mb-2 text-sm font-semibold text-slate-700 dark:text-slate-300">Decided</h2>
-          <div className="table-wrap overflow-hidden rounded-[--radius-card] border border-slate-200 dark:border-slate-800">
+          <div className="overflow-x-auto rounded-[--radius-card] border border-slate-200 dark:border-slate-800">
             <table className="w-full text-sm">
               <thead className="bg-slate-50 text-left text-xs text-slate-500 dark:bg-slate-900 dark:text-slate-400">
                 <tr>

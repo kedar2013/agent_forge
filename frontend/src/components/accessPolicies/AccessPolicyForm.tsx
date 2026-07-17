@@ -285,7 +285,7 @@ export default function AccessPolicyForm({
         <p className="text-xs text-slate-400">
           How to find each user's persona — a table/collection with one row per identity.
         </p>
-        <div className="grid grid-cols-3 gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
           <Input label="Table / collection" hideLabel={false} value={personaSource} onChange={(e) => setPersonaSource(e.target.value)} />
           <Input label="Match column" hideLabel={false} value={personaMatch} onChange={(e) => setPersonaMatch(e.target.value)} />
           <Input label="Persona column" hideLabel={false} value={personaProject} onChange={(e) => setPersonaProject(e.target.value)} />
@@ -297,7 +297,7 @@ export default function AccessPolicyForm({
           Coverage lookups (optional, for "id-scoped" rules)
         </legend>
         {scopeLookups.map((lookup, i) => (
-          <div key={i} className="grid grid-cols-[1fr_1fr_1fr_1fr_auto] items-end gap-2">
+          <div key={i} className="grid grid-cols-1 items-end gap-2 sm:grid-cols-2 lg:grid-cols-[1fr_1fr_1fr_1fr_auto]">
             <Input
               label="Name"
               hideLabel={false}

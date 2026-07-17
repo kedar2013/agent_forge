@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { Bot, Bug, LogOut, MessageSquarePlus, Send, User } from 'lucide-react'
+import { Bot, Bug, LogOut, Menu, MessageSquarePlus, Send, User, X } from 'lucide-react'
 import { toast } from 'sonner'
 import {
   ChatApiError,
@@ -58,6 +58,9 @@ export default function ChatPage() {
   const [activeSessionId, setActiveSessionId] = useState<string>(() => getLastActiveSessionId() ?? crypto.randomUUID())
   const [turns, setTurns] = useState<Turn[]>([])
   const [historyLoaded, setHistoryLoaded] = useState(false)
+  // The conversation list becomes a slide-over drawer below the `lg`
+  // breakpoint, same pattern as Layout.tsx's admin-shell nav.
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [input, setInput] = useState('')
   const [pending, setPending] = useState(false)
   const [liveSteps, setLiveSteps] = useState<ThinkingStep[]>([])
@@ -208,13 +211,41 @@ export default function ChatPage() {
   const activeTitle = conversations.find((c) => c.session_id === activeSessionId)?.title ?? 'New conversation'
 
   return (
-    <div className="flex h-screen">
-      <aside className="flex w-64 shrink-0 flex-col border-r border-white/60 bg-white/70 backdrop-blur-xl dark:border-white/5 dark:bg-slate-950/70">
+    <div className="flex h-screen flex-col lg:flex-row">
+      {mobileNavOpen && (
+        <div
+          className="fixed inset-0 z-30 bg-slate-950/50 lg:hidden"
+          onClick={() => setMobileNavOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+
+      <aside
+        className={`fixed inset-y-0 left-0 z-40 flex w-72 shrink-0 transform flex-col border-r border-white/60 bg-white/95 backdrop-blur-xl transition-transform duration-200 ease-in-out dark:border-white/5 dark:bg-slate-950/95 lg:static lg:z-auto lg:w-64 lg:translate-x-0 lg:bg-white/70 lg:transition-none dark:lg:bg-slate-950/70 ${
+          mobileNavOpen ? 'translate-x-0' : '-translate-x-full'
+        }`}
+      >
         <div className="p-3">
-          <div className="mb-3 flex items-center gap-2 px-1">
+          <div className="mb-3 flex items-center justify-between gap-2 px-1">
             <Logo size="sm" />
+            <button
+              onClick={() => setMobileNavOpen(false)}
+              className="rounded-md p-1 text-slate-400 hover:bg-slate-100 lg:hidden dark:hover:bg-slate-800"
+              aria-label="Close conversation list"
+            >
+              <X size={18} />
+            </button>
           </div>
-          <Button variant="outline" tone="neutral" onClick={handleNewConversation} className="w-full" leftIcon={<MessageSquarePlus size={16} />}>
+          <Button
+            variant="outline"
+            tone="neutral"
+            onClick={() => {
+              handleNewConversation()
+              setMobileNavOpen(false)
+            }}
+            className="w-full"
+            leftIcon={<MessageSquarePlus size={16} />}
+          >
             New chat
           </Button>
         </div>
@@ -232,7 +263,10 @@ export default function ChatPage() {
                 {group.conversations.map((conv) => (
                   <button
                     key={conv.session_id}
-                    onClick={() => loadConversation(conv.session_id, conv.agent_name)}
+                    onClick={() => {
+                      loadConversation(conv.session_id, conv.agent_name)
+                      setMobileNavOpen(false)
+                    }}
                     className={`block w-full truncate rounded-md px-2.5 py-2 text-left text-sm ${
                       conv.session_id === activeSessionId
                         ? 'bg-brand-50 font-medium text-brand-700 dark:bg-brand-950 dark:text-brand-300'
@@ -277,8 +311,17 @@ export default function ChatPage() {
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex items-center justify-between border-b border-white/60 bg-white/70 px-4 py-3 backdrop-blur-xl dark:border-white/5 dark:bg-slate-950/70">
-          <div className="truncate text-sm font-semibold">{activeTitle}</div>
+        <header className="flex items-center justify-between gap-2 border-b border-white/60 bg-white/70 px-4 py-3 backdrop-blur-xl dark:border-white/5 dark:bg-slate-950/70">
+          <div className="flex min-w-0 items-center gap-2">
+            <button
+              onClick={() => setMobileNavOpen(true)}
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 lg:hidden dark:text-slate-300 dark:hover:bg-slate-800"
+              aria-label="Open conversation list"
+            >
+              <Menu size={18} />
+            </button>
+            <div className="truncate text-sm font-semibold">{activeTitle}</div>
+          </div>
           {orchestrators.length > 1 && (
             <label className="flex shrink-0 items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
               Bot

@@ -502,7 +502,7 @@ export default function DataEntityForm({
         </Button>
       </fieldset>
 
-      <fieldset className="grid grid-cols-4 gap-3 rounded-md border border-slate-200 p-3 dark:border-slate-700">
+      <fieldset className="grid grid-cols-1 gap-3 rounded-md border border-slate-200 p-3 sm:grid-cols-2 lg:grid-cols-4 dark:border-slate-700">
         <legend className="px-1 text-xs font-semibold uppercase text-slate-500">Defaults</legend>
         <GuidedField
           label="Sort field"

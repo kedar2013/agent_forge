@@ -9,6 +9,7 @@ import {
   FileClock,
   Home,
   LogOut,
+  Menu,
   MessageSquare,
   PlusSquare,
   Receipt,
@@ -18,6 +19,7 @@ import {
   Sparkles,
   UserCog,
   Wrench,
+  X,
 } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
 import CommandPalette from './CommandPalette'
@@ -76,11 +78,11 @@ function handleLogout() {
   window.location.reload()
 }
 
-function NavList({ items }: { items: NavItem[] }) {
+function NavList({ items, onNavigate }: { items: NavItem[]; onNavigate?: () => void }) {
   return (
     <nav className="space-y-0.5">
       {items.map(({ to, label, icon: Icon, end }) => (
-        <NavLink key={to} to={to} className={navItemClass} end={end}>
+        <NavLink key={to} to={to} className={navItemClass} end={end} onClick={onNavigate}>
           <Icon size={16} />
           {label}
         </NavLink>
@@ -101,7 +103,17 @@ function useSidebarGroupOpen(key: string): [boolean, (open: boolean) => void] {
   return [open, set]
 }
 
-function CollapsibleNavGroup({ title, items, storageKey }: { title: string; items: NavItem[]; storageKey: string }) {
+function CollapsibleNavGroup({
+  title,
+  items,
+  storageKey,
+  onNavigate,
+}: {
+  title: string
+  items: NavItem[]
+  storageKey: string
+  onNavigate?: () => void
+}) {
   const [open, setOpen] = useSidebarGroupOpen(storageKey)
   if (items.length === 0) return null
   return (
@@ -111,7 +123,7 @@ function CollapsibleNavGroup({ title, items, storageKey }: { title: string; item
         <ChevronDown size={12} className="transition-transform group-open:rotate-180" />
       </summary>
       <div className="mt-1">
-        <NavList items={items} />
+        <NavList items={items} onNavigate={onNavigate} />
       </div>
     </details>
   )
@@ -119,6 +131,7 @@ function CollapsibleNavGroup({ title, items, storageKey }: { title: string; item
 
 export default function Layout() {
   const [paletteOpen, setPaletteOpen] = useState(false)
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const role = getStoredRole()
   const visibleBuildItems = buildItems.filter((item) => item.roles.includes(role))
   const visibleGovernanceItems = governanceItems.filter((item) => item.roles.includes(role))
@@ -136,15 +149,53 @@ export default function Layout() {
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [])
 
+  const closeMobileNav = () => setMobileNavOpen(false)
+
   return (
-    <div className="flex min-h-screen bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
-      <aside className="flex w-52 shrink-0 flex-col border-r border-white/60 bg-white/60 p-4 backdrop-blur-xl dark:border-white/5 dark:bg-slate-950/60">
+    <div className="flex min-h-screen flex-col bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100 lg:flex-row">
+      {/* Mobile-only top bar — the persistent sidebar below becomes a slide-over
+          drawer under the `lg` breakpoint, opened from here. */}
+      <div className="flex items-center justify-between border-b border-slate-200 bg-white/70 px-4 py-3 backdrop-blur-xl lg:hidden dark:border-slate-800 dark:bg-slate-950/70">
+        <button
+          onClick={() => setMobileNavOpen(true)}
+          className="flex h-9 w-9 items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+          aria-label="Open navigation menu"
+        >
+          <Menu size={20} />
+        </button>
+        <Logo size="sm" />
+        <span className="w-9" aria-hidden="true" />
+      </div>
+
+      {mobileNavOpen && (
+        <div
+          className="fixed inset-0 z-30 bg-slate-950/50 lg:hidden"
+          onClick={closeMobileNav}
+          aria-hidden="true"
+        />
+      )}
+
+      <aside
+        className={`fixed inset-y-0 left-0 z-40 flex w-72 shrink-0 transform flex-col border-r border-white/60 bg-white/95 p-4 backdrop-blur-xl transition-transform duration-200 ease-in-out dark:border-white/5 dark:bg-slate-950/95 lg:static lg:z-auto lg:w-52 lg:translate-x-0 lg:bg-white/60 lg:transition-none dark:lg:bg-slate-950/60 ${
+          mobileNavOpen ? 'translate-x-0' : '-translate-x-full'
+        }`}
+      >
         <div className="mb-6 flex items-center justify-between px-2">
           <Logo size="md" />
+          <button
+            onClick={closeMobileNav}
+            className="rounded-md p-1 text-slate-400 hover:bg-slate-100 lg:hidden dark:hover:bg-slate-800"
+            aria-label="Close navigation menu"
+          >
+            <X size={18} />
+          </button>
         </div>
 
         <button
-          onClick={() => setPaletteOpen(true)}
+          onClick={() => {
+            setPaletteOpen(true)
+            closeMobileNav()
+          }}
           className="mb-4 flex items-center gap-2 rounded-md border border-slate-200 px-3 py-1.5 text-sm text-slate-400 hover:border-slate-300 hover:text-slate-500 dark:border-slate-800 dark:hover:border-slate-700"
         >
           <Search size={15} />
@@ -152,19 +203,29 @@ export default function Layout() {
           <kbd className="rounded border border-slate-200 px-1 text-[10px] dark:border-slate-700">Ctrl K</kbd>
         </button>
 
-        <NavList items={overviewItems} />
+        <NavList items={overviewItems} onNavigate={closeMobileNav} />
 
         <div className="mt-4 mb-1 px-3 text-[11px] font-semibold tracking-wide text-slate-400 uppercase">Build</div>
-        <NavList items={visibleBuildItems} />
+        <NavList items={visibleBuildItems} onNavigate={closeMobileNav} />
 
         {chatVisible && (
           <div className="mt-0.5">
-            <NavList items={[chatItem]} />
+            <NavList items={[chatItem]} onNavigate={closeMobileNav} />
           </div>
         )}
 
-        <CollapsibleNavGroup title="Governance" items={visibleGovernanceItems} storageKey="governance" />
-        <CollapsibleNavGroup title="Observability" items={visibleObserveItems} storageKey="observability" />
+        <CollapsibleNavGroup
+          title="Governance"
+          items={visibleGovernanceItems}
+          storageKey="governance"
+          onNavigate={closeMobileNav}
+        />
+        <CollapsibleNavGroup
+          title="Observability"
+          items={visibleObserveItems}
+          storageKey="observability"
+          onNavigate={closeMobileNav}
+        />
 
         <div className="mt-auto border-t border-slate-200 pt-3 dark:border-slate-800">
           <div className="mb-2 flex items-center justify-between gap-2 px-3 text-xs text-slate-400">
@@ -186,7 +247,7 @@ export default function Layout() {
           <StudioCredit className="mt-3 px-3" />
         </div>
       </aside>
-      <main className="min-w-0 flex-1 p-6">
+      <main className="min-w-0 flex-1 p-4 sm:p-6">
         <Outlet />
       </main>
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
