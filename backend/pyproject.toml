@@ -28,7 +28,17 @@ dependencies = [
     # since that fresh install resolved to 2.5.0 while local dev stayed on
     # whatever was installed when 2.4.0 was current. Bump deliberately, not
     # by drift.
-    "google-adk==2.4.0",
+    #
+    # The "[mcp]" extra matters just as much as the pin: google-adk's
+    # tools/mcp_tool/__init__.py wraps its McpToolset/MCPToolset imports in
+    # a bare `except ImportError: pass`, so if the optional mcp>=1.24,<2 +
+    # anyio>=4.9,<5 deps that extra pulls in aren't installed, McpToolset
+    # silently doesn't exist at all instead of raising anything obviously
+    # related to "mcp" or "anyio" missing. Local dev worked without it only
+    # because the `mcp` package happened to already be installed from
+    # unrelated earlier work in this venv — a fresh install (Railway) has
+    # nothing to fall back on.
+    "google-adk[mcp]==2.4.0",
     # Claude support: litellm is what google.adk.models.lite_llm.LiteLlm needs
     # to route an agent's model= at Anthropic instead of Gemini (see
     # agent_runtime/builder.py); anthropic is the official SDK used directly
