@@ -35,16 +35,32 @@ async def _load_policies(
     return {str(p.id): p for p in result.scalars().all()}
 
 
+#  A router orchestrator built with orchestration_patterns.build_router_
+# instruction() is instructed to never transfer to the same specialist twice
+# for one question — this is the hard backstop if a model ignores that.
+# Generous enough for a question that legitimately needs several
+# specialists (each one costs 2 transfers: out to it, back to the parent),
+# while still bounding a model that starts cycling regardless of the
+# instruction. Keyed per-turn (see _before_tool below), never across turns.
+_MAX_TRANSFERS_PER_TURN = 8
+
+
 def _build_before_tool_callback(tools_rows: list[Tool], policies_by_id: dict[str, AccessPolicy]):
     """One callback, registered on every agent this platform builds, that
-    generically (a) injects trusted, server-verified session-state values
-    (e.g. the caller's principal id) into any tool whose config lists them
-    under `context_params`, and (b) for any tool whose config carries a
+    generically (a) caps how many agent-to-agent hand-offs can happen in a
+    single turn (see _MAX_TRANSFERS_PER_TURN above) — applies to every
+    agent uniformly, not just ones deliberately built as a multi-specialist
+    router, since ADK's transfer_to_agent is itself just another
+    FunctionTool and so already flows through this same callback; (b)
+    injects trusted, server-verified session-state values (e.g. the
+    caller's principal id) into any tool whose config lists them under
+    `context_params`; and (c) for any tool whose config carries a
     `policy_id`, mechanically enforces that `AccessPolicy`'s row-level
     filter — or denies the call outright — before the tool ever runs.
 
-    Neither mechanism is specific to any one tool type or domain: a future
-    domain opts in purely through `tools.config`, no code here changes.
+    None of these three are specific to any one tool type or domain: a
+    future domain/orchestrator opts in purely through its own config (or,
+    for the hop cap, simply by existing) — no code here changes.
     """
     context_params_by_tool = {
         t.name: t.config["context_params"] for t in tools_rows if t.config.get("context_params")
@@ -52,6 +68,22 @@ def _build_before_tool_callback(tools_rows: list[Tool], policies_by_id: dict[str
     policy_by_tool = {t.name: t.config["policy_id"] for t in tools_rows if t.config.get("policy_id")}
 
     async def _before_tool(tool, args, tool_context):
+        if tool.name == "transfer_to_agent":
+            # invocation_id is unique per top-level runner.run_async() call
+            # (one user turn) and never reused across turns, so this counter
+            # needs no explicit reset — a brand-new turn always starts at 0.
+            state_key = f"_transfer_hops:{tool_context.invocation_id}"
+            hops = tool_context.state.get(state_key, 0) + 1
+            tool_context.state[state_key] = hops
+            if hops > _MAX_TRANSFERS_PER_TURN:
+                return {
+                    "error": (
+                        "Too many agent hand-offs for this single question. Stop "
+                        "transferring and answer now with whatever has already been "
+                        "gathered, noting plainly anything you weren't able to resolve."
+                    )
+                }
+
         mapping = context_params_by_tool.get(tool.name)
         if mapping:
             for arg_name, state_key in mapping.items():

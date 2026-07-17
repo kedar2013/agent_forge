@@ -3,25 +3,31 @@ structured-data (NL2SQL) domain on this platform, and attaches the
 CURRENTLY onboarded domain specialists (`credit_facility_analyst`,
 `revenue_returns_analyst`) to it as sub-agents.
 
-This is a pure router, same shape as `market_intelligence_orchestrator`
-(scripts/seed_market_agents.py) — zero tools of its own, `base_instruction`
-lists each specialist and when to transfer to it. No new ADK/transfer
-mechanism is needed for specialists to invoke EACH OTHER: Google ADK's
-`transfer_to_agent` already allows any agent to transfer to its own
-children, its parent, AND its parent's other children (siblings) by
-default (`disallow_transfer_to_peers` defaults False, and
-`app/agent_runtime/builder.py` never sets it) — the only thing this script
-adds on top of that built-in mechanism is explicit routing/collaboration
-sentences on the orchestrator AND on each specialist's own instruction, so
-the model reliably uses that path instead of only relying on ADK's
-auto-generated transfer-target list. This mirrors the existing convention
-in `seed_reporting_specialist.py`.
+This is a pure router built entirely on
+`app.agent_runtime.orchestration_patterns` — the generic, reusable
+"transfer to the right specialist(s), let each one bounce back to you for
+anything outside its own domain, combine the partial answers into one
+final reply" pattern any router orchestrator wires up the same way,
+whether a given question needs one specialist, two, or all N of them. No
+new ADK/transfer mechanism is needed for specialists to invoke EACH OTHER:
+Google ADK's `transfer_to_agent` already allows any agent to transfer to
+its own children, its parent, AND its parent's other children (siblings)
+by default (`disallow_transfer_to_peers` defaults False, and
+`app/agent_runtime/builder.py` never sets it) — orchestration_patterns
+just adds the routing/collaboration instructions on top of that built-in
+mechanism, plus builder.py's shared before_tool_callback caps how many
+hand-offs can happen in one turn as a backstop against a model that
+ignores the "never transfer to the same specialist twice" rule.
 
 Designed to scale past two specialists: `SPECIALISTS` below is the single
-source of truth for both the orchestrator's routing bullets and which
+source of truth for both the orchestrator's routing directory and which
 agents get attached — onboarding a third domain (see
 `backend/app/domains/<name>/` for the pattern any domain already follows)
-means adding one entry here and re-running this script, nothing else.
+means adding one entry here and re-running this script, nothing else. The
+underlying instruction (orchestration_patterns.build_router_instruction)
+was written for exactly this: it never hardcodes "first specialist,
+second specialist" — it describes a loop that covers however many domains
+a given question actually touches.
 
 Idempotent: `--reset` detaches the specialists, strips the appended
 collaboration clauses back out of their instructions, republishes them,
@@ -34,7 +40,6 @@ Usage (from backend/, so `app.*` imports resolve):
 
 import argparse
 import asyncio
-import re
 import sys
 from pathlib import Path
 
@@ -43,6 +48,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sqlalchemy import delete, select  # noqa: E402
 
 from app.agent_runtime.cache import agent_cache  # noqa: E402
+from app.agent_runtime.orchestration_patterns import (  # noqa: E402
+    build_peer_clause,
+    build_router_instruction,
+    strip_peer_clause,
+)
 from app.db import async_session_factory  # noqa: E402
 from app.logging_hooks import write_audit_log  # noqa: E402
 from app.models.agents import Agent, AgentSkill, AgentSubagent, AgentTool, AgentVersion  # noqa: E402
@@ -61,117 +71,27 @@ AGENT_DESCRIPTION = (
     "questions. Currently onboarded: credit facility, revenue & returns."
 )
 
-# Single source of truth: one entry per onboarded domain specialist. Adding
+# Single source of truth: one entry per onboarded domain specialist, mapping
+# its exact published name to a one-line description of its domain. Adding
 # a new domain later = add one entry here (+ re-run this script) — nothing
-# else about the orchestrator's instruction needs hand-editing.
-#   name              -> the published agent's exact name
-#   directory_line     -> the orchestrator's routing bullet for it
-#   peer_clause         -> appended to THIS specialist's own base_instruction,
-#                          naming every OTHER specialist it can hand off to
+# else about the orchestrator's instruction needs hand-editing; see
+# build_router_instruction's docstring for why that's true regardless of
+# how many entries end up here.
 SPECIALISTS = {
-    "credit_facility_analyst": {
-        "directory_line": (
-            "- credit_facility_analyst: companies' credit facility usage — limits, utilization, "
-            "outstanding balances, overdue amounts. Access is scoped by the logged-in user's "
-            "persona (GCM/GSG/Non-GSG/CCB); the specialist handles that itself."
-        ),
-    },
-    "revenue_returns_analyst": {
-        "directory_line": (
-            "- revenue_returns_analyst: product revenue, returns, and refunds — gross/net revenue, "
-            "return rates, units sold/returned, by business unit/category/product/region."
-        ),
-    },
+    "credit_facility_analyst": (
+        "companies' credit facility usage — limits, utilization, outstanding balances, "
+        "overdue amounts. Access is scoped by the logged-in user's persona "
+        "(GCM/GSG/Non-GSG/CCB); the specialist handles that itself."
+    ),
+    "revenue_returns_analyst": (
+        "product revenue, returns, and refunds — gross/net revenue, return rates, "
+        "units sold/returned, by business unit/category/product/region."
+    ),
 }
 
 
 def _orchestrator_instruction() -> str:
-    directory = "\n".join(spec["directory_line"] for spec in SPECIALISTS.values())
-    return f"""You are the NL2SQL orchestrator — the single entry point for every
-structured-data domain on this platform. You never answer a data question yourself;
-you always transfer to the right domain specialist. Each specialist writes its own
-real SQL against its own tables and enforces its own access rules — you don't need
-to know any of that, only which specialist owns which topic.
-
-Specialists currently onboarded:
-{directory}
-
-Routing rules:
-1. Identify which specialist's domain the question belongs to and transfer to
-   exactly that one. If the domain is unambiguous, transfer immediately — don't
-   ask the user to pick.
-2. If a question spans more than one specialist's domain (e.g. "show me both the
-   credit facility exposure and the revenue for a company" or "compare this
-   product's returns to that company's overdue balance"), transfer to the first
-   relevant specialist for its part. Each specialist is instructed to transfer
-   BACK to you (rather than guess or decline) once it notices the question needs
-   data outside its own domain — when that happens, you'll see its partial answer
-   in the conversation already; transfer to the second relevant specialist for the
-   remaining part, then present ONE combined final answer that clearly attributes
-   each figure to its source domain rather than just concatenating two separate
-   replies or dropping the part you already have.
-3. If the request doesn't clearly belong to any onboarded specialist's domain, say
-   so plainly and list what you can currently help with — don't guess or transfer
-   to a specialist that isn't a good fit.
-4. Never fabricate figures yourself; you have no data tools of your own by design,
-   only transfer targets.
-
-When a new domain is onboarded, it gets a new bullet in this list and a new
-sub-agent attachment — nothing else about this instruction changes."""
-
-
-# Wraps the appended clause so `_strip_peer_clause` can find and remove it
-# by MARKER rather than by exact text match — the clause's wording has
-# already changed once during live testing (see git history / this
-# session), and matching on literal text meant `reset()` silently failed to
-# remove the old wording and a second, different clause got appended on
-# top of it instead of replacing it. Markers make wording changes safe.
-_PEER_CLAUSE_START = "\n\n<!-- nl2sql-peer-clause:start -->"
-_PEER_CLAUSE_END = "<!-- nl2sql-peer-clause:end -->"
-
-
-def _peer_clause(this_specialist: str) -> str:
-    """Deliberately points every specialist back at the ORCHESTRATOR
-    (its parent), never sideways at a named peer directly — each specialist
-    only ever needs to know ONE fact ("go back to nl2sql_orchestrator for
-    anything outside my domain"), not the full roster of every other
-    onboarded domain. This is what keeps SPECIALISTS the single place a new
-    domain gets added: a new specialist's own instruction never has to be
-    rewritten when a further domain shows up later, only this same generic
-    clause. (An earlier version had each specialist name every peer
-    directly and transfer sideways — verified live to be less reliable:
-    the model would often just decline the out-of-domain part instead of
-    invoking transfer_to_agent a second time. Routing back through the
-    orchestrator, which explicitly expects and handles this handoff in its
-    own instruction above, tests more reliably.)
-
-    Explicitly forbids narrating the handoff ("I will now transfer...") —
-    verified live: `_resolve_response_text` concatenates every agent's text
-    output across a multi-hop turn (the same reason AgentEventLog has a
-    dedicated `model_text` event type, see app/models/logs.py), so a
-    specialist thinking out loud about transferring leaks that narration
-    (plus a duplicate of its own answer) into what the user sees as one
-    reply. Silent transfer avoids it without touching that shared code path."""
-    if len(SPECIALISTS) < 2:
-        return ""
-    body = (
-        "If the user's question ALSO needs data outside your own domain, do not decline "
-        "or guess and do not narrate what you're about to do — first answer the part you "
-        "can, then silently call transfer_to_agent to transfer back to nl2sql_orchestrator "
-        "(your parent) with a brief note on what still needs answering, so it can route the "
-        "rest to the right specialist. Never silently drop the out-of-domain part, and never "
-        "tell the user you're transferring — just do it."
-    )
-    return f"{_PEER_CLAUSE_START}\n{body}\n{_PEER_CLAUSE_END}"
-
-
-def _strip_peer_clause(instruction: str) -> str:
-    return re.sub(
-        re.escape(_PEER_CLAUSE_START) + r".*?" + re.escape(_PEER_CLAUSE_END),
-        "",
-        instruction,
-        flags=re.DOTALL,
-    )
+    return build_router_instruction("structured-data (NL2SQL)", SPECIALISTS)
 
 
 async def _get_agent(session, name: str) -> Agent | None:
@@ -226,7 +146,7 @@ async def reset(session) -> None:
         specialist = await _get_agent(session, specialist_name)
         if specialist is None:
             continue
-        stripped = _strip_peer_clause(specialist.base_instruction)
+        stripped = strip_peer_clause(specialist.base_instruction)
         if stripped != specialist.base_instruction:
             specialist.base_instruction = stripped
             await _republish(session, specialist)
@@ -294,12 +214,15 @@ async def main() -> None:
             specialist = await _get_agent(session, specialist_name)
             session.add(AgentSubagent(parent_agent_id=orchestrator.id, child_agent_id=specialist.id))
 
-            clause = _peer_clause(specialist_name)
-            stripped = _strip_peer_clause(specialist.base_instruction)
+            # No peer clause needed with a single specialist — nothing to
+            # hand off to yet.
+            clause = build_peer_clause() if len(SPECIALISTS) >= 2 else ""
+            stripped = strip_peer_clause(specialist.base_instruction)
             if clause and stripped + clause != specialist.base_instruction:
                 # Strip-then-append (rather than a not-in check) so a wording
-                # change to _peer_clause replaces the old clause instead of
-                # stacking a second one alongside it — see _strip_peer_clause.
+                # change to build_peer_clause() replaces the old clause
+                # instead of stacking a second one alongside it — see
+                # strip_peer_clause.
                 specialist.base_instruction = stripped + clause
                 await _republish(session, specialist)
                 print(f"  Added/updated peer-collaboration clause on '{specialist_name}' (now version {specialist.current_version}).")
