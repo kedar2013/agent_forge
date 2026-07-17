@@ -75,11 +75,15 @@ export function useToolUsage(rangeDays: number) {
   })
 }
 
-export function useUserUsage(rangeDays: number) {
+// admin-only server-side (see backend/app/dashboards_api/usage.py) — enabled
+// defaults true for admin/viewer callers; UsagePage passes false for a
+// developer so this never fires a request that would just 403.
+export function useUserUsage(rangeDays: number, enabled = true) {
   return useQuery({
     queryKey: ['dashboards', 'usage', 'users', rangeDays],
     queryFn: () => api.get<UserUsageRow[]>(`/dashboards/usage/users?range_days=${rangeDays}`),
     refetchInterval: 30_000,
+    enabled,
   })
 }
 

@@ -76,7 +76,7 @@ function AdminApp() {
           <Route
             path="/usage"
             element={
-              <RequireRole roles={['admin', 'viewer']}>
+              <RequireRole roles={['admin', 'viewer', 'developer']}>
                 <UsagePage />
               </RequireRole>
             }
@@ -93,7 +93,7 @@ function AdminApp() {
           <Route
             path="/scil"
             element={
-              <RequireRole roles={['admin']}>
+              <RequireRole roles={['admin', 'developer']}>
                 <ScilDashboardPage />
               </RequireRole>
             }

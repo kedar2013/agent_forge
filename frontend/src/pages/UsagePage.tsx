@@ -19,6 +19,7 @@ import SegmentedControl from '../components/ui/SegmentedControl'
 import { Skeleton } from '../components/ui/Skeleton'
 import StatTile from '../components/ui/StatTile'
 import { buildCategoricalScale, useIsDarkMode } from '../lib/chartPalette'
+import { getStoredRole } from '../lib/auth'
 
 const ROLE_TONE: Record<string, BadgeTone> = { admin: 'brand', viewer: 'info', chat_user: 'neutral' }
 
@@ -51,12 +52,16 @@ export default function UsagePage() {
   const [rangeDays, setRangeDays] = useState(30)
   const [metric, setMetric] = useState<Metric>('invocations')
   const isDark = useIsDarkMode()
+  // /dashboards/usage/users is admin-only server-side (it's about other
+  // people's activity, not agent cost) — every other endpoint on this page
+  // is scoped to "my own agents" for a developer instead of hidden.
+  const isDeveloper = getStoredRole() === 'developer'
 
   const { data: summary, isLoading: summaryLoading } = useUsageSummary(rangeDays)
   const { data: timeseries, isLoading: tsLoading } = useUsageTimeseries(rangeDays)
   const { data: agentUsage, isLoading: agentsLoading } = useAgentUsage(rangeDays)
   const { data: toolUsage, isLoading: toolsLoading } = useToolUsage(rangeDays)
-  const { data: userUsage, isLoading: usersLoading } = useUserUsage(rangeDays)
+  const { data: userUsage, isLoading: usersLoading } = useUserUsage(rangeDays, !isDeveloper)
 
   const agentNames = useMemo(
     () => Array.from(new Set((timeseries ?? []).map((p) => p.agent_name))),
@@ -83,7 +88,9 @@ export default function UsagePage() {
             <LiveBadge />
           </div>
           <p className="text-sm text-slate-500 dark:text-slate-400">
-            Volume, tokens, and estimated cost across every agent.
+            {isDeveloper
+              ? 'Volume, tokens, and estimated cost across the agents you created.'
+              : 'Volume, tokens, and estimated cost across every agent.'}
           </p>
         </div>
         <SegmentedControl options={RANGE_OPTIONS} value={rangeDays} onChange={setRangeDays} aria-label="Date range" />
@@ -222,6 +229,7 @@ export default function UsagePage() {
         </Card>
       </div>
 
+      {!isDeveloper && (
       <div>
         <h2 className="mb-2 text-sm font-semibold text-slate-700 dark:text-slate-300">Usage by user</h2>
         <Card className="overflow-x-auto p-0">
@@ -277,6 +285,7 @@ export default function UsagePage() {
           )}
         </Card>
       </div>
+      )}
     </div>
   )
 }

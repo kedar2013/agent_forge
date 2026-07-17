@@ -35,6 +35,7 @@ import SegmentedControl from '../components/ui/SegmentedControl'
 import { Skeleton } from '../components/ui/Skeleton'
 import StatTile from '../components/ui/StatTile'
 import { useIsDarkMode } from '../lib/chartPalette'
+import { getStoredRole } from '../lib/auth'
 
 // Client-side grouping for the correction-memory filter: the backend only
 // supports exact-match on error_signature, but each category (e.g.
@@ -87,7 +88,13 @@ function pct(x: number): string {
 }
 
 export default function ScilDashboardPage() {
-  const [tab, setTab] = useState<TabValue>('overview')
+  // Cache/correction curation and workspace-wide cost metrics (the
+  // "Overview" tab) are admin-only server-side — a developer only ever gets
+  // the Evals tab (their own agents' eval suite + groundedness sampling),
+  // so there's nothing to switch between and the tab control itself is
+  // hidden rather than shown with one dead option.
+  const isDeveloper = getStoredRole() === 'developer'
+  const [tab, setTab] = useState<TabValue>(isDeveloper ? 'evals' : 'overview')
   const [rangeDays, setRangeDays] = useState(30)
   const [cacheOffset, setCacheOffset] = useState(0)
   const [correctionsOffset, setCorrectionsOffset] = useState(0)
@@ -102,10 +109,15 @@ export default function ScilDashboardPage() {
     ref.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }
 
-  const { data: summary, isLoading: summaryLoading } = useScilSummary(rangeDays)
-  const { data: timeseries, isLoading: tsLoading } = useScilTimeseries(rangeDays)
-  const { data: cache, isLoading: cacheLoading } = useScilCacheEntries(cacheOffset)
-  const { data: corrections, isLoading: correctionsLoading } = useScilCorrections(correctionsOffset)
+  const { data: summary, isLoading: summaryLoading } = useScilSummary(rangeDays, !isDeveloper)
+  const { data: timeseries, isLoading: tsLoading } = useScilTimeseries(rangeDays, !isDeveloper)
+  const { data: cache, isLoading: cacheLoading } = useScilCacheEntries(cacheOffset, 25, !isDeveloper)
+  const { data: corrections, isLoading: correctionsLoading } = useScilCorrections(
+    correctionsOffset,
+    25,
+    undefined,
+    !isDeveloper,
+  )
   const deleteCacheEntry = useDeleteCacheEntry()
   const purgeAgentCache = usePurgeAgentCache()
   const deleteCorrection = useDeleteCorrection()
@@ -159,12 +171,16 @@ export default function ScilDashboardPage() {
             <LiveBadge />
           </div>
           <p className="text-sm text-slate-500 dark:text-slate-400">
-            Self-Correcting Intelligence Layer — LLM calls avoided by the semantic cache, self-correction retry
-            outcomes, and the cached/correction knowledge behind them.
+            {isDeveloper
+              ? "Golden-question regression results and live groundedness sampling for the agents you created."
+              : 'Self-Correcting Intelligence Layer — LLM calls avoided by the semantic cache, self-correction retry '
+                + 'outcomes, and the cached/correction knowledge behind them.'}
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <SegmentedControl options={TABS} value={tab} onChange={setTab} aria-label="Dashboard section" />
+          {!isDeveloper && (
+            <SegmentedControl options={TABS} value={tab} onChange={setTab} aria-label="Dashboard section" />
+          )}
           <SegmentedControl options={RANGE_OPTIONS} value={rangeDays} onChange={setRangeDays} aria-label="Date range" />
         </div>
       </div>

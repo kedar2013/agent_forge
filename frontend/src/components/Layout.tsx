@@ -56,10 +56,10 @@ const governanceItems: NavItem[] = [
 
 const observeItems: NavItem[] = [
   { to: '/monitoring', label: 'Monitoring', icon: Activity, end: false, roles: ['admin', 'viewer'] },
-  { to: '/usage', label: 'Usage', icon: Receipt, end: false, roles: ['admin', 'viewer'] },
+  { to: '/usage', label: 'Usage', icon: Receipt, end: false, roles: ['admin', 'viewer', 'developer'] },
   { to: '/audit', label: 'Audit', icon: FileClock, end: false, roles: ['admin', 'viewer'] },
   { to: '/debug', label: 'Debug Console', icon: Bug, end: false, roles: ['admin', 'viewer', 'developer'] },
-  { to: '/scil', label: 'SCIL', icon: DatabaseZap, end: false, roles: ['admin'] },
+  { to: '/scil', label: 'SCIL', icon: DatabaseZap, end: false, roles: ['admin', 'developer'] },
 ]
 
 const ROLE_LABEL: Record<AdminShellRole, string> = { admin: 'Admin', viewer: 'Viewer', developer: 'Developer' }

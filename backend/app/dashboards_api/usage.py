@@ -26,29 +26,36 @@ def _since(range_days: int) -> datetime:
     return datetime.now(timezone.utc) - timedelta(days=range_days)
 
 
+def _actor(principal: Principal) -> str:
+    return principal.email or f"{principal.role} (static token)"
+
+
 @router.get("/summary", response_model=UsageSummary)
 async def usage_summary(
     range_days: int = Query(30, ge=1, le=365),
     db: AsyncSession = Depends(get_db),
-    principal: Principal = Depends(require_role("admin", "viewer")),
+    principal: Principal = Depends(require_role("admin", "viewer", "developer")),
 ) -> UsageSummary:
     since = _since(range_days)
-    row = (
-        await db.execute(
-            select(
-                func.count(InvocationLog.id),
-                func.coalesce(func.sum(InvocationLog.estimated_cost_usd), 0),
-                func.coalesce(
-                    func.sum(func.coalesce(InvocationLog.input_tokens, 0) + func.coalesce(InvocationLog.output_tokens, 0)),
-                    0,
-                ),
-                func.count(func.distinct(InvocationLog.agent_id)),
-            ).where(
-                InvocationLog.created_at >= since,
-                InvocationLog.workspace_id == principal.workspace_id,
-            )
-        )
-    ).one()
+    query = select(
+        func.count(InvocationLog.id),
+        func.coalesce(func.sum(InvocationLog.estimated_cost_usd), 0),
+        func.coalesce(
+            func.sum(func.coalesce(InvocationLog.input_tokens, 0) + func.coalesce(InvocationLog.output_tokens, 0)),
+            0,
+        ),
+        func.count(func.distinct(InvocationLog.agent_id)),
+    ).where(
+        InvocationLog.created_at >= since,
+        InvocationLog.workspace_id == principal.workspace_id,
+    )
+    if principal.role == "developer":
+        # Admin/viewer see the whole workspace; a developer sees costs
+        # scoped to only the agents THEY created — this dashboard exists so
+        # a developer can see what their own Playground/BYOK usage is
+        # costing, not everyone else's.
+        query = query.join(Agent, Agent.id == InvocationLog.agent_id).where(Agent.created_by == _actor(principal))
+    row = (await db.execute(query)).one()
     total, total_cost, total_tokens, unique_agents = row
     return UsageSummary(
         total_invocations=total or 0,
@@ -62,12 +69,12 @@ async def usage_summary(
 async def usage_timeseries(
     range_days: int = Query(30, ge=1, le=365),
     db: AsyncSession = Depends(get_db),
-    principal: Principal = Depends(require_role("admin", "viewer")),
+    principal: Principal = Depends(require_role("admin", "viewer", "developer")),
 ) -> list[UsageTimeseriesPoint]:
     since = _since(range_days)
     day = func.date_trunc("day", InvocationLog.created_at).label("day")
 
-    result = await db.execute(
+    query = (
         select(
             day,
             InvocationLog.agent_id,
@@ -80,9 +87,10 @@ async def usage_timeseries(
             InvocationLog.created_at >= since,
             InvocationLog.workspace_id == principal.workspace_id,
         )
-        .group_by(day, InvocationLog.agent_id, Agent.name)
-        .order_by(day)
     )
+    if principal.role == "developer":
+        query = query.where(Agent.created_by == _actor(principal))
+    result = await db.execute(query.group_by(day, InvocationLog.agent_id, Agent.name).order_by(day))
 
     return [
         UsageTimeseriesPoint(
@@ -100,11 +108,11 @@ async def usage_timeseries(
 async def agent_usage(
     range_days: int = Query(30, ge=1, le=365),
     db: AsyncSession = Depends(get_db),
-    principal: Principal = Depends(require_role("admin", "viewer")),
+    principal: Principal = Depends(require_role("admin", "viewer", "developer")),
 ) -> list[AgentUsageRow]:
     since = _since(range_days)
 
-    result = await db.execute(
+    query = (
         select(
             Agent.id,
             Agent.name,
@@ -120,8 +128,10 @@ async def agent_usage(
             InvocationLog.created_at >= since,
             Agent.workspace_id == principal.workspace_id,
         )
-        .group_by(Agent.id, Agent.name)
     )
+    if principal.role == "developer":
+        query = query.where(Agent.created_by == _actor(principal))
+    result = await db.execute(query.group_by(Agent.id, Agent.name))
 
     rows = []
     for agent_id, name, count, tokens, cost in result:
@@ -144,11 +154,11 @@ async def agent_usage(
 async def tool_usage(
     range_days: int = Query(30, ge=1, le=365),
     db: AsyncSession = Depends(get_db),
-    principal: Principal = Depends(require_role("admin", "viewer")),
+    principal: Principal = Depends(require_role("admin", "viewer", "developer")),
 ) -> list[ToolUsageRow]:
     since = _since(range_days)
 
-    result = await db.execute(
+    query = (
         select(Tool.id, Tool.name, Agent.name)
         .select_from(ToolCallLog)
         .join(Tool, Tool.id == ToolCallLog.tool_id)
@@ -159,6 +169,13 @@ async def tool_usage(
             Tool.workspace_id == principal.workspace_id,
         )
     )
+    if principal.role == "developer":
+        # The outerjoin means a tool call with no agent_id would otherwise
+        # slip through unfiltered -- Agent.created_by is NULL for those, so
+        # this condition correctly excludes them too (not attributable to
+        # this developer either).
+        query = query.where(Agent.created_by == _actor(principal))
+    result = await db.execute(query)
 
     call_counts: dict = {}
     agent_names: dict = {}

@@ -80,32 +80,39 @@ export interface ScilCorrectionListResponse {
 
 const KEY = ['scil'] as const
 
-export function useScilSummary(rangeDays: number) {
+// These four are admin-only server-side (see backend/app/scil_api/router.py)
+// — cache/correction curation and workspace-wide cost metrics, as opposed to
+// eval/groundedness below which a developer can see for their own agents.
+// `enabled` lets ScilDashboardPage skip firing them at all for a developer.
+export function useScilSummary(rangeDays: number, enabled = true) {
   const from = new Date(Date.now() - rangeDays * 86_400_000).toISOString()
   return useQuery({
     queryKey: [...KEY, 'summary', rangeDays],
     queryFn: () => api.get<ScilMetricsSummary>(`/scil/metrics/summary?from_date=${encodeURIComponent(from)}`),
     refetchInterval: 30_000,
+    enabled,
   })
 }
 
-export function useScilTimeseries(rangeDays: number) {
+export function useScilTimeseries(rangeDays: number, enabled = true) {
   return useQuery({
     queryKey: [...KEY, 'timeseries', rangeDays],
     queryFn: () => api.get<ScilTimeseriesPoint[]>(`/scil/metrics/timeseries?range_days=${rangeDays}`),
     refetchInterval: 30_000,
+    enabled,
   })
 }
 
-export function useScilCacheEntries(offset: number, limit = 25) {
+export function useScilCacheEntries(offset: number, limit = 25, enabled = true) {
   return useQuery({
     queryKey: [...KEY, 'cache', offset, limit],
     queryFn: () => api.get<ScilCacheListResponse>(`/scil/cache/entries?limit=${limit}&offset=${offset}`),
     refetchInterval: 30_000,
+    enabled,
   })
 }
 
-export function useScilCorrections(offset: number, limit = 25, errorSignature?: string) {
+export function useScilCorrections(offset: number, limit = 25, errorSignature?: string, enabled = true) {
   return useQuery({
     queryKey: [...KEY, 'corrections', offset, limit, errorSignature ?? null],
     queryFn: () => {
@@ -114,6 +121,7 @@ export function useScilCorrections(offset: number, limit = 25, errorSignature?: 
       return api.get<ScilCorrectionListResponse>(`/scil/corrections?${params.toString()}`)
     },
     refetchInterval: 30_000,
+    enabled,
   })
 }
 

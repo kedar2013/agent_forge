@@ -71,9 +71,22 @@ def _cache_similarity_threshold(agent: Agent) -> float:
     return float((agent.model_config_json or {}).get("scil", {}).get("cache_similarity_threshold", _DEFAULT_CACHE_SIMILARITY_THRESHOLD))
 
 
+def _actor(principal: Principal) -> str:
+    return principal.email or f"{principal.role} (static token)"
+
+
 async def _get_owned_agent(db: AsyncSession, agent_id: uuid.UUID, principal: Principal) -> Agent:
+    """admin (and viewer, where allowed) can look up any agent in the
+    workspace. A developer can only see SCIL data for agents THEY created —
+    same ownership rule as config_api/agents.py's _require_can_modify, since
+    eval/groundedness results can reveal another developer's agent's
+    instructions and real user-facing behavior. 404, not 403: a developer
+    has no legitimate reason to learn that a workspace-mate's agent_id
+    exists at all."""
     agent = await db.get(Agent, agent_id)
     if agent is None or agent.workspace_id != principal.workspace_id:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if principal.role == "developer" and agent.created_by != _actor(principal):
         raise HTTPException(status_code=404, detail="Agent not found")
     return agent
 
@@ -439,7 +452,7 @@ async def _latest_run_by_case(db: AsyncSession, case_ids: list[int]) -> dict[int
 async def list_eval_cases(
     agent_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    principal: Principal = Depends(require_role("admin")),
+    principal: Principal = Depends(require_role("admin", "developer")),
 ) -> list[ScilEvalCaseEntry]:
     await _get_owned_agent(db, agent_id, principal)
     cases = (
@@ -516,7 +529,7 @@ async def delete_eval_case(
 async def run_eval_batch(
     payload: ScilEvalRunRequest,
     db: AsyncSession = Depends(get_db),
-    principal: Principal = Depends(require_role("admin")),
+    principal: Principal = Depends(require_role("admin", "developer")),
 ) -> ScilEvalBatchSummary:
     """Runs every active golden case for this agent against its PUBLISHED
     version right now, grades each with an LLM judge, and writes one
@@ -542,7 +555,7 @@ async def run_eval_batch(
     if not cases:
         raise HTTPException(status_code=422, detail="No active eval cases for this agent — add one first")
 
-    model = (agent_row.model_config_json or {}).get("model", "gemini-2.5-flash")
+    model = (agent_row.model_config_json or {}).get("model", "gemini-3.5-flash")
     adk_agent = await get_or_build_agent(db, payload.agent_id, version=agent_row.current_version)
     batch_id = uuid.uuid4()
     results: list[ScilEvalRunResult] = []
@@ -618,7 +631,7 @@ async def run_eval_batch(
 async def latest_eval_batch(
     agent_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    principal: Principal = Depends(require_role("admin")),
+    principal: Principal = Depends(require_role("admin", "developer")),
 ) -> ScilEvalBatchSummary:
     await _get_owned_agent(db, agent_id, principal)
     latest_batch_id = await db.scalar(
@@ -670,8 +683,11 @@ async def groundedness_summary(
     agent_id: uuid.UUID | None = None,
     range_days: int = Query(30, ge=1, le=365),
     db: AsyncSession = Depends(get_db),
-    principal: Principal = Depends(require_role("admin")),
+    principal: Principal = Depends(require_role("admin", "developer")),
 ) -> ScilGroundednessSummary:
+    if agent_id:
+        await _get_owned_agent(db, agent_id, principal)
+
     since = datetime.now(timezone.utc) - timedelta(days=range_days)
     day = func.date_trunc("day", ScilGroundednessSample.created_at).label("day")
     ts_query = (
@@ -681,6 +697,11 @@ async def groundedness_summary(
     )
     if agent_id:
         ts_query = ts_query.where(ScilGroundednessSample.agent_id == agent_id)
+    elif principal.role == "developer":
+        # No agent_id given -- scope the aggregate to only the developer's
+        # own agents rather than every agent in the workspace (the same
+        # implicit restriction _get_owned_agent enforces for a specific id).
+        ts_query = ts_query.where(Agent.created_by == _actor(principal))
     ts_query = ts_query.group_by(day, ScilGroundednessSample.grounded).order_by(day)
 
     by_day: dict[str, dict[str, int]] = {}
@@ -704,6 +725,7 @@ async def groundedness_summary(
                 ScilGroundednessSample.created_at >= since,
                 ScilGroundednessSample.grounded.is_(False),
                 *([ScilGroundednessSample.agent_id == agent_id] if agent_id else []),
+                *([Agent.created_by == _actor(principal)] if not agent_id and principal.role == "developer" else []),
             )
             .order_by(ScilGroundednessSample.created_at.desc())
             .limit(20)

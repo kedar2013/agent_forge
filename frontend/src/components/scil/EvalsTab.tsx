@@ -19,6 +19,7 @@ import { Skeleton } from '../ui/Skeleton'
 import StatTile from '../ui/StatTile'
 import Textarea from '../ui/Textarea'
 import { useIsDarkMode } from '../../lib/chartPalette'
+import { getStoredRole, getUserEmail } from '../../lib/auth'
 
 function pct(x: number): string {
   return `${(x * 100).toFixed(1)}%`
@@ -30,10 +31,21 @@ export default function EvalsTab({ rangeDays }: { rangeDays: number }) {
   const [question, setQuestion] = useState('')
   const [criteria, setCriteria] = useState('')
   const isDark = useIsDarkMode()
+  // A developer can list every agent in the workspace (config_api/agents.py's
+  // list_agents is read-visible team-wide), but the backend's SCIL eval/
+  // groundedness endpoints 404 on any agent a developer didn't create (see
+  // app/scil_api/router.py's _get_owned_agent) — filter the picker down to
+  // match, so nothing selectable here ever dead-ends into a 404.
+  const isDeveloper = getStoredRole() === 'developer'
+  const myEmail = getUserEmail()
 
   const evalCandidates = useMemo(
-    () => (agents ?? []).filter((a) => a.status === 'published').sort((a, b) => a.name.localeCompare(b.name)),
-    [agents],
+    () =>
+      (agents ?? [])
+        .filter((a) => a.status === 'published')
+        .filter((a) => !isDeveloper || a.created_by === myEmail)
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    [agents, isDeveloper, myEmail],
   )
 
   const { data: cases, isLoading: casesLoading } = useEvalCases(agentId || undefined)

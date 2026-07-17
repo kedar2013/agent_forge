@@ -116,7 +116,7 @@ async def create_tool(
 @router.get("", response_model=list[ToolRead])
 async def list_tools(
     db: AsyncSession = Depends(get_db),
-    principal: Principal = Depends(require_role("admin", "viewer")),
+    principal: Principal = Depends(require_role("admin", "viewer", "developer")),
 ) -> list[Tool]:
     result = await db.execute(
         select(Tool).where(Tool.workspace_id == principal.workspace_id).order_by(Tool.created_at.desc())
@@ -128,7 +128,7 @@ async def list_tools(
 async def get_tool(
     tool_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    principal: Principal = Depends(require_role("admin", "viewer")),
+    principal: Principal = Depends(require_role("admin", "viewer", "developer")),
 ) -> Tool:
     tool = await db.get(Tool, tool_id)
     if tool is None or tool.workspace_id != principal.workspace_id:
