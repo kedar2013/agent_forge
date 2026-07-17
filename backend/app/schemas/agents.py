@@ -47,7 +47,7 @@ class ScilAgentConfig(BaseModel):
 
 
 class ModelConfig(BaseModel):
-    model: str = "gemini-2.5-flash"
+    model: str = "gemini-3.5-flash"
     temperature: float = 0.3
     scil: ScilAgentConfig | None = None
 

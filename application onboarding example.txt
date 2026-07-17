@@ -85,7 +85,7 @@ STEP-BY-STEP: BUILDING "Company Research Copilot"
        user to buy/sell/hold, and if asked for a recommendation, clarify you
        can only surface data and trends, not personalized financial advice.
 
-   - Leave Model as gemini-2.5-flash, Temperature 0.2–0.3
+   - Leave Model as gemini-3.5-flash, Temperature 0.2–0.3
    - Click "Create agent" — this takes you to the agent's own page.
 
 2. ATTACH THE TOOLS

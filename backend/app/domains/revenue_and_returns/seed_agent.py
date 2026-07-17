@@ -47,7 +47,7 @@ from app.models.tools import Tool
 from app.models.workspaces import DEFAULT_WORKSPACE_ID
 
 SEED_MARKER = "revenue-returns-import"
-MODEL_CONFIG = {"model": "gemini-2.5-flash", "temperature": 0.1}
+MODEL_CONFIG = {"model": "gemini-3.5-flash", "temperature": 0.1}
 MYSQL_CONNECTION = {"type": "mysql", "connection_env_prefix": "REVENUE_RETURNS_MYSQL"}
 
 AGENT_NAME = "revenue_returns_analyst"

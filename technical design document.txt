@@ -93,7 +93,7 @@ published root agent rather than letting the caller pick any agent id.
 BACKEND
   FastAPI (async), SQLAlchemy 2.0 (async) + asyncpg, Alembic (migrations),
   Google ADK (agent runtime — Agent, Runner, sub-agent transfer, MCP tool
-  integration, session services), Gemini (gemini-2.5-flash by default,
+  integration, session services), Gemini (gemini-3.5-flash by default,
   configurable per agent), Pydantic v2, httpx (all outbound HTTP), MCP
   Python SDK (mcp.server.fastmcp.FastMCP — each mcp_servers/*.py is a
   standalone MCP server run over stdio), reportlab + openpyxl (document

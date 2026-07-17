@@ -7,6 +7,9 @@ never as a billing-accurate figure.
 
 # {model_prefix: (input $/1M tokens, output $/1M tokens)}
 _PRICING_PER_MILLION_TOKENS: dict[str, tuple[float, float]] = {
+    # Estimate carried over from gemini-2.5-flash pending an official rate
+    # for this newer model -- see module docstring, never billing-accurate.
+    "gemini-3.5-flash": (0.30, 2.50),
     "gemini-2.5-flash": (0.30, 2.50),
     "gemini-2.5-pro": (1.25, 10.00),
     "gemini-2.0-flash": (0.10, 0.40),

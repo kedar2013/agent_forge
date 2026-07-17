@@ -205,7 +205,7 @@ async def test_hallucination_retry_exhaustion_logs_unresolved_event(client, uniq
 
 
 async def test_groundedness_check_flags_an_ungrounded_answer():
-    agent_row = SimpleNamespace(model_config_json={"model": "gemini-2.5-flash"})
+    agent_row = SimpleNamespace(model_config_json={"model": "gemini-3.5-flash"})
     tool_calls = [ToolCallTrace(name="query_orders", input={}, output={"total": 3891})]
     # The response invents a figure ($4,200) that appears nowhere in the tool
     # output ($3,891) — an unambiguous case for the judge to catch.
@@ -216,7 +216,7 @@ async def test_groundedness_check_flags_an_ungrounded_answer():
 
 
 async def test_groundedness_check_accepts_a_grounded_answer():
-    agent_row = SimpleNamespace(model_config_json={"model": "gemini-2.5-flash"})
+    agent_row = SimpleNamespace(model_config_json={"model": "gemini-3.5-flash"})
     tool_calls = [ToolCallTrace(name="query_orders", input={}, output={"total": 3891})]
     response_text = "The total is $3,891."
     result = await check_groundedness(response_text, tool_calls, agent_row)
@@ -226,6 +226,6 @@ async def test_groundedness_check_accepts_a_grounded_answer():
 async def test_groundedness_check_skips_when_no_tool_calls():
     # Nothing to ground against — the zero-tool-call check already covers
     # this case for free; check_groundedness must not spend a second call.
-    agent_row = SimpleNamespace(model_config_json={"model": "gemini-2.5-flash"})
+    agent_row = SimpleNamespace(model_config_json={"model": "gemini-3.5-flash"})
     result = await check_groundedness("anything", [], agent_row)
     assert result.ok

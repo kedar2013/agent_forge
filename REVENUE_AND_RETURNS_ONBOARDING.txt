@@ -292,7 +292,7 @@ convention for a specialist agent with no sub-agents — see README's
     6. Never fabricate numbers. If a tool call returns zero rows, say so
        plainly rather than inventing figures."
 
-  model_config: {"model": "gemini-2.5-flash", "temperature": 0.1} (low
+  model_config: {"model": "gemini-3.5-flash", "temperature": 0.1} (low
   temperature — this is a data-lookup agent, not a creative one; matches
   every other data_query_tool agent in this repo).
 

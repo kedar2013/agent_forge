@@ -31,7 +31,7 @@ from app.models.skills import Skill  # noqa: E402
 from app.models.tools import Tool  # noqa: E402
 
 SEED_MARKER = "studybuddy-import"
-MODEL_CONFIG = {"model": "gemini-2.5-flash", "temperature": 0.3}
+MODEL_CONFIG = {"model": "gemini-3.5-flash", "temperature": 0.3}
 
 SCOPE_HANDOFF = """Scope: you only handle the task described above. If the student's latest
 message asks for anything else — a new topic question, a different chapter

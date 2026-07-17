@@ -52,7 +52,7 @@ from app.models.tools import Tool  # noqa: E402
 from app.models.workspaces import DEFAULT_WORKSPACE_ID  # noqa: E402
 
 SEED_MARKER = "nl2sql-orchestrator-import"
-MODEL_CONFIG = {"model": "gemini-2.5-flash", "temperature": 0.1}
+MODEL_CONFIG = {"model": "gemini-3.5-flash", "temperature": 0.1}
 
 AGENT_NAME = "nl2sql_orchestrator"
 AGENT_DESCRIPTION = (

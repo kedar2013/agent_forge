@@ -27,7 +27,7 @@ async def test_build_from_live_config_composes_attached_skills(db_session, uniqu
     agent = Agent(
         name=unique_name("runtime_agent"),
         base_instruction="You are helpful.",
-        model_config_json={"model": "gemini-2.5-flash", "temperature": 0.1},
+        model_config_json={"model": "gemini-3.5-flash", "temperature": 0.1},
     )
     skill_a = Skill(name=unique_name("skill_a"), instruction_text="Be terse.")
     skill_b = Skill(name=unique_name("skill_b"), instruction_text="Cite sources.")
@@ -50,7 +50,7 @@ async def test_cache_hit_and_invalidation(db_session, unique_name):
     agent = Agent(
         name=unique_name("cached_agent"),
         base_instruction="Cached agent instruction.",
-        model_config_json={"model": "gemini-2.5-flash"},
+        model_config_json={"model": "gemini-3.5-flash"},
         status="published",
         current_version=1,
     )
@@ -63,7 +63,7 @@ async def test_cache_hit_and_invalidation(db_session, unique_name):
             "name": agent.name,
             "description": None,
             "base_instruction": agent.base_instruction,
-            "model_config": {"model": "gemini-2.5-flash"},
+            "model_config": {"model": "gemini-3.5-flash"},
             "tools": [],
             "skills": [],
             "sub_agents": [],

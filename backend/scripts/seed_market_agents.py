@@ -28,7 +28,7 @@ from app.models.tools import Tool  # noqa: E402
 from app.models.workspaces import DEFAULT_WORKSPACE_ID  # noqa: E402
 
 SEED_MARKER = "market-data-import"
-MODEL_CONFIG = {"model": "gemini-2.5-flash", "temperature": 0.2}
+MODEL_CONFIG = {"model": "gemini-3.5-flash", "temperature": 0.2}
 
 DISCLAIMER = (
     "You provide data and analysis, not investment advice. Never tell the user "

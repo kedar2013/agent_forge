@@ -15,7 +15,7 @@ async def test_create_agent_default_model_config(client, unique_name):
     agent = await _create_agent(client, unique_name)
     assert agent["status"] == "draft"
     assert agent["current_version"] == 1
-    assert agent["model_config"]["model"] == "gemini-2.5-flash"
+    assert agent["model_config"]["model"] == "gemini-3.5-flash"
     assert agent["tools"] == []
     assert agent["skills"] == []
 

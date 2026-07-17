@@ -63,7 +63,7 @@ async def check_groundedness(response_text: str, tool_calls: list[Any], agent_ro
         return _VALID
 
     try:
-        model = (agent_row.model_config_json or {}).get("model", "gemini-2.5-flash")
+        model = (agent_row.model_config_json or {}).get("model", "gemini-3.5-flash")
         prompt = _JUDGE_PROMPT_TEMPLATE.format(
             tool_calls_block=_format_tool_calls(tool_calls), response_text=response_text
         )

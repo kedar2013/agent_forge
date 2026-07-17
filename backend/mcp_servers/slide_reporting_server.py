@@ -68,7 +68,7 @@ mcp = FastMCP("slide-reporting")
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "generated_files")
 TEMP_CHART_DIR = os.path.join(OUTPUT_DIR, "_chart_tmp")
 PUBLIC_BASE_URL = os.environ.get("BACKEND_PUBLIC_URL", "http://127.0.0.1:8000")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 
 _ROWS_PER_TABLE_SLIDE = 12
 

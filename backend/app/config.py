@@ -26,7 +26,10 @@ class Settings(BaseSettings):
         return v
 
     gemini_api_key: str
-    gemini_model: str = "gemini-2.5-flash"
+    # gemini-2.5-flash 404s on new API keys/projects ("no longer available to
+    # new users") even though it's still nominally a stable model for older
+    # ones -- gemini-3.5-flash is the current default new keys actually get.
+    gemini_model: str = "gemini-3.5-flash"
 
     # Optional — only needed if an agent's model_config.model is set to one of
     # the "anthropic/claude-..." options in the Agent Builder's model

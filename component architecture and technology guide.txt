@@ -108,7 +108,7 @@ WHAT IT IS
 BUILT WITH
   Google ADK (google.adk.agents.Agent, google.adk.runners.Runner,
   google.adk.sessions — InMemorySessionService for Playground,
-  DatabaseSessionService for /invoke and /chat), Gemini (gemini-2.5-flash
+  DatabaseSessionService for /invoke and /chat), Gemini (gemini-3.5-flash
   default, per-agent configurable), backend/app/agent_runtime/ (builder.py,
   cache.py, schema_utils.py), backend/app/playground_api/router.py (the
   shared turn-execution engine every run surface funnels through).
@@ -851,7 +851,7 @@ BACKEND
   Validation           Pydantic v2
   Config               pydantic-settings + python-dotenv
   Agent runtime        Google ADK (google.adk.agents/runners/sessions)
-  LLM                  Gemini (gemini-2.5-flash default)
+  LLM                  Gemini (gemini-3.5-flash default)
   Tool protocol        MCP (Model Context Protocol) Python SDK
   Outbound HTTP        httpx
   Document export       reportlab (PDF), openpyxl (Excel)

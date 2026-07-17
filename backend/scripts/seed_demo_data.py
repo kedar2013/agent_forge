@@ -30,7 +30,7 @@ from app.observability.pricing import estimate_cost_usd  # noqa: E402
 
 SEED_MARKER = "demo-seed"
 DAYS = 30
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3.5-flash"
 
 DEMO_TOOLS = [
     {
