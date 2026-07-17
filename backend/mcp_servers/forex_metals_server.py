@@ -1,7 +1,7 @@
 """A real MCP server for currency exchange rates and precious metals spot
 prices — frankfurter.app (ECB reference rates, free, no API key) and
 gold-api.com (free, no API key). Runs over stdio, spawned as a subprocess by
-Eärendil's mcp_tool (StdioConnectionParams), following the same pattern as
+Agent Forge's mcp_tool (StdioConnectionParams), following the same pattern as
 mutual_fund_server.py.
 
 Run standalone for a smoke test:

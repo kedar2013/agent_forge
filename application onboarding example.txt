@@ -1,4 +1,4 @@
-Eärendil — ONBOARDING A NEW AGENT VIA THE UI
+Agent Forge — ONBOARDING A NEW AGENT VIA THE UI
 Worked example: "Company Research Copilot"
 ==============================================================================
 

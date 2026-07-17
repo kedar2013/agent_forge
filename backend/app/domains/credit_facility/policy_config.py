@@ -24,10 +24,10 @@ SEARCH_POLICY_NAME = "credit_facility_search_access"
 RESOLVER_CONFIG = {
     "type": "mysql",
     "connection_env_prefix": "CREDIT_FACILITY_MYSQL",
-    # Match on the logged-in user's SOEID (corporate id), not Eärendil's own
+    # Match on the logged-in user's SOEID (corporate id), not Agent Forge's own
     # opaque account id — an admin grants access by setting a user's SOEID
     # (Users page) to one already present in cf_user_persona, rather than
-    # needing this domain's own data reseeded per Eärendil account.
+    # needing this domain's own data reseeded per Agent Forge account.
     "identity_state_key": "_principal_soeid",
     "persona_lookup": {
         "source": "cf_user_persona",

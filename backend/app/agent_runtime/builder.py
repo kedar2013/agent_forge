@@ -68,7 +68,7 @@ def _build_before_tool_callback(tools_rows: list[Tool], policies_by_id: dict[str
             return {"error": "Misconfigured tool: referenced access policy not found."}
 
         # A policy decides which trusted identity it matches persona/coverage
-        # data against — the raw Eärendil user id by default, or a corporate
+        # data against — the raw Agent Forge user id by default, or a corporate
         # id (e.g. SOEID) for domains whose own data is keyed by that instead
         # (see chat_api/router.py's _ensure_session_state for what's on state).
         identity_key = policy.resolver_config.get("identity_state_key", "_principal_user_id")

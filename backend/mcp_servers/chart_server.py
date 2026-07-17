@@ -3,7 +3,7 @@
 already has (trailing returns, NAV/price history, quarterly revenue, a
 multi-fund/stock/coin comparison) into an inline chart image for its chat
 reply -- pure local computation (matplotlib via _chart_utils.py), no
-external API. Runs over stdio, spawned as a subprocess by Eärendil's
+external API. Runs over stdio, spawned as a subprocess by Agent Forge's
 mcp_tool (StdioConnectionParams), following the same pattern as the other
 mcp_servers/*.py files.
 

@@ -273,7 +273,7 @@ export default function AccessPolicyForm({
             value={identityStateKey}
             onChange={(e) => setIdentityStateKey(e.target.value)}
             options={[
-              { label: 'Eärendil account id (default)', value: '_principal_user_id' },
+              { label: 'Agent Forge account id (default)', value: '_principal_user_id' },
               { label: 'SOEID (corporate id)', value: '_principal_soeid' },
             ]}
           />

@@ -41,11 +41,11 @@ export default function HelpButton() {
         <HelpCircle size={13} />
       </button>
 
-      <Modal open={open} onClose={() => setOpen(false)} title="About Eärendil" maxWidth="max-w-md">
+      <Modal open={open} onClose={() => setOpen(false)} title="About Agent Forge" maxWidth="max-w-md">
         <div className="space-y-5">
           <div className="flex flex-col items-center gap-2 text-center">
             <Logo size="lg" withWordmark={false} />
-            <h3 className="text-lg font-semibold">Eärendil</h3>
+            <h3 className="text-lg font-semibold">Agent Forge</h3>
             <p className="text-sm text-slate-500 dark:text-slate-400">
               Compose, test, and publish AI agents without touching code.
             </p>

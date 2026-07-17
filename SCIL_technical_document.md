@@ -1,13 +1,13 @@
 # SCIL — Self-Correcting Intelligence Layer
 ## Complete Technical Documentation (System + Dashboard)
 
-*Eärendil (Agent Forge) — July 2026*
+*Agent Forge — July 2026*
 
 ---
 
 ## 1. What SCIL is and why it exists
 
-Every agent turn in Eärendil — playground test runs, published `/invoke`
+Every agent turn in Agent Forge — playground test runs, published `/invoke`
 calls, and both chat surfaces — used to result in one or more full Gemini
 LLM calls, **even when**:
 

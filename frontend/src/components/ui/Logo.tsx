@@ -18,14 +18,14 @@ export default function Logo({
     <div className={`flex items-center gap-2 ${className}`}>
       <img
         src="/favicon.svg"
-        alt="Eärendil"
+        alt="Agent Forge"
         width={mark}
         height={mark}
         className="shrink-0 drop-shadow-[0_2px_8px_rgba(94,63,230,0.35)]"
       />
       {withWordmark && (
         <span className={`bg-gradient-to-r from-brand-600 to-accent-500 bg-clip-text font-bold tracking-tight text-transparent dark:from-brand-300 dark:to-accent-400 ${text}`}>
-          Eärendil
+          Agent Forge
         </span>
       )}
     </div>

@@ -1,6 +1,6 @@
 """A real MCP server for cryptocurrency market data — CoinGecko's free public
 API (no API key required for these endpoints). Runs over stdio, spawned as a
-subprocess by Eärendil's mcp_tool (StdioConnectionParams), following the same
+subprocess by Agent Forge's mcp_tool (StdioConnectionParams), following the same
 pattern as mutual_fund_server.py.
 
 Like analyze_fund_performance there, `analyze_crypto_performance` computes

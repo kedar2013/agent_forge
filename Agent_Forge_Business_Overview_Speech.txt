@@ -1,4 +1,4 @@
-EÄRENDIL — BUSINESS OVERVIEW SPEECH
+AGENT FORGE — BUSINESS OVERVIEW SPEECH
 For presenting to a non-technical business audience
 (Read time: ~10-12 minutes at a comfortable pace)
 ==============================================================================
@@ -6,7 +6,7 @@ For presenting to a non-technical business audience
 [OPENING]
 
 Good [morning/afternoon], everyone. I want to walk you through something
-we've built called Eärendil — think of it as our in-house factory for
+we've built called Agent Forge — think of it as our in-house factory for
 building AI assistants, without needing an engineer to write code every
 time we want a new one.
 
@@ -28,13 +28,13 @@ ways by ten different people. We wanted one platform, one set of guardrails,
 and a way for the people who understand the business — not just the people
 who can code — to build and adjust these assistants themselves.
 
-That's what Eärendil is.
+That's what Agent Forge is.
 
 ------------------------------------------------------------------------------
-WHAT EÄRENDIL IS, IN ONE BREATH
+WHAT AGENT FORGE IS, IN ONE BREATH
 ------------------------------------------------------------------------------
 
-Eärendil is a web-based control panel where you compose an AI agent out of
+Agent Forge is a web-based control panel where you compose an AI agent out of
 building blocks — like assembling furniture from parts, rather than carving
 it from a tree. You pick what data it's allowed to touch, what actions it's
 allowed to take, what personality and instructions it follows, test it in a
@@ -198,7 +198,7 @@ cutting both cost and response time on the assistants where it's enabled.
 CLOSING — WHY THIS MATTERS TO THIS ROOM
 ------------------------------------------------------------------------------
 
-So, to bring it home: Eärendil means that when a business team has an idea
+So, to bring it home: Agent Forge means that when a business team has an idea
 for an AI assistant, the path from idea to a safe, tested, live tool is
 measured in days, not quarters — and it's a path business owners can walk
 themselves, with engineering only needed the first time we teach the

@@ -1,6 +1,6 @@
 REVENUE AND RETURNS — NEW DOMAIN ONBOARDING GUIDE
 ===================================================
-Target platform: Agent Onboarding / Eärendil (backend/, FastAPI + Google ADK)
+Target platform: Agent Forge (backend/, FastAPI + Google ADK)
 Written: 2026-07-14
 UPDATE 2026-07-14: this domain has since actually been built following the
 steps below (Path B, scripted) and is live — `revenue_returns_analyst` is
@@ -139,7 +139,7 @@ STEP 3 — (Optional) Design row-level access, if this domain needs it
 Skip this step entirely if every user should see all revenue/returns data.
 If different users should see different products/business units, decide:
 
-  - What identifies a user for lookup purposes: their Eärendil account id
+  - What identifies a user for lookup purposes: their Agent Forge account id
     (`_principal_user_id`) or their corporate SOEID (`_principal_soeid`,
     admin-assignable on /users) — credit_facility uses SOEID.
   - What personas exist and what each can see. Suggested starting point,

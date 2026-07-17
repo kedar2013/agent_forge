@@ -137,7 +137,7 @@ async def _ensure_session_state(app_name: str, user_id: str, session_id: str, pr
         # (see agent_runtime/builder.py) to inject into, or authorize, a
         # tool call — the LLM never sees or controls these values. An
         # access_policy picks which one it matches on via
-        # resolver_config["identity_state_key"] (defaults to the Eärendil
+        # resolver_config["identity_state_key"] (defaults to the Agent Forge
         # user id; set to "_principal_soeid" for domains keyed by a
         # corporate id instead). Harmless for agents/tools that don't use
         # either, same as _DEFAULT_CHAT_STATE.

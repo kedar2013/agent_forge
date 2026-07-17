@@ -24,7 +24,7 @@ export default function NewDomainWizard() {
             Onboard a new domain
           </h1>
           <p className="mt-2 text-sm leading-relaxed text-slate-500 dark:text-slate-400">
-            Point Eärendil at a database table and get a published text-to-SQL agent — the LLM writes every query
+            Point Agent Forge at a database table and get a published text-to-SQL agent — the LLM writes every query
             itself at chat time, validated and row-level-scoped, so there's no SQL to author here at all.
           </p>
         </div>

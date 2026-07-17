@@ -67,7 +67,7 @@ export default function DomainStep({
           />
         </GuidedField>
         <p className="text-xs text-slate-400">
-          This wizard configures how Eärendil accesses and gates data that already exists — it doesn't create
+          This wizard configures how Agent Forge accesses and gates data that already exists — it doesn't create
           databases or tables.
         </p>
         <div className="flex justify-end pt-2">

@@ -29,7 +29,7 @@ export default function HomePage() {
   return (
     <div className="space-y-8">
       <PageHeader
-        title="Welcome to Eärendil"
+        title="Welcome to Agent Forge"
         description="Compose, test, and publish Google ADK agents without touching code."
       />
 

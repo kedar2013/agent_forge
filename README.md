@@ -1,5 +1,5 @@
 
-# Eärendil (Agent Forge)
+# Agent Forge
 
 UI-driven platform for composing, testing, and publishing Google ADK agents
 from Postgres-backed configuration — no code required to wire up a tool,
@@ -44,7 +44,7 @@ attach a skill, or route between sub-agents.
   dashboards, and user management, plus a separate white-labeled end-user
   chat surface (`/chat`)
 - **Row-level security, generically**: `access_policies` resolves a logged-in
-  user's persona (keyed by their Eärendil account or by a corporate SOEID —
+  user's persona (keyed by their Agent Forge account or by a corporate SOEID —
   `users.soeid`, admin-assignable on `/users`) and mechanically enforces a
   scope predicate on every query, regardless of what an LLM-generated query
   says. See "Capability library" below for the data-access tools that
@@ -126,7 +126,7 @@ A banking/credit-risk domain built entirely on the generic pieces above —
 `access_policies` + `data_entities` + `data_query_tool` — rather than any
 domain-specific code. Row-level access varies by persona (GCM: global,
 GSG: no L2 visibility, Non-GSG: assigned-companies-only, CCB: exact-`gfcid`
-reference only), resolved from either the user's Eärendil account or their
+reference only), resolved from either the user's Agent Forge account or their
 SOEID. See `backend/app/domains/credit_facility/` for the data model and
 seed scripts, or build an equivalent domain yourself with zero code via
 `/onboarding/new-domain` in the admin UI.

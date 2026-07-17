@@ -208,6 +208,12 @@ async def _bump_ancestors(session, changed_agent_ids: set) -> None:
 
 
 async def _load_agents(session) -> dict[str, Agent]:
+    """Not every deployment has all of TARGET_AGENT_NAMES -- fund_analyst_agent
+    and company_research_copilot were hand-built via the admin UI on one
+    particular instance, not seeded by any script, so a different deployment
+    (e.g. a fresh hosted environment) legitimately won't have them. Skip
+    whichever are missing rather than aborting the whole run, so the ones
+    that DO exist still get wired up; only bail out if none of them do."""
     agents: dict[str, Agent] = {}
     missing = []
     for name in TARGET_AGENT_NAMES:
@@ -217,7 +223,9 @@ async def _load_agents(session) -> dict[str, Agent]:
         else:
             agents[name] = agent
     if missing:
-        print(f"Agent(s) not found: {', '.join(missing)} -- seed them first.")
+        print(f"Agent(s) not found, skipping: {', '.join(missing)}")
+    if not agents:
+        print("No target agents found at all -- seed them first.")
         sys.exit(1)
     return agents
 

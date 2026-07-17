@@ -45,7 +45,7 @@ Register it as a Tool (Tools page -> "New Tool"):
                     the backend)
        Args:        path to mcp_servers/document_export_server.py
        Tool name:   export_to_pdf   (must match the @mcp.tool() function
-                    name exactly — this is how Eärendil finds the right
+                    name exactly — this is how Agent Forge finds the right
                     function on that server)
   6. Input schema (what the LLM must provide when it calls this tool):
        {

@@ -3,7 +3,7 @@ import { createContext, useContext, useEffect, useState, type ReactNode } from '
 export type Theme = 'light' | 'dark' | 'midnight' | 'sunset' | 'forest' | 'rose' | 'system'
 export type ResolvedTheme = 'light' | 'dark' | 'midnight' | 'sunset' | 'forest' | 'rose'
 
-const STORAGE_KEY = 'Eärendil-theme'
+const STORAGE_KEY = 'agent-forge-theme'
 
 // Which resolved themes are dark-based (get the `.dark` class + native
 // color-scheme: dark — see index.css). "system" never resolves to one of

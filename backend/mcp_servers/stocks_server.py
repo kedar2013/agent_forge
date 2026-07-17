@@ -1,6 +1,6 @@
 """A real MCP server for global stocks & indices — Yahoo Finance's public,
 unauthenticated `chart` and `search` endpoints (free, no API key). Runs over
-stdio, spawned as a subprocess by Eärendil's mcp_tool (StdioConnectionParams),
+stdio, spawned as a subprocess by Agent Forge's mcp_tool (StdioConnectionParams),
 following the same pattern as mutual_fund_server.py.
 
 Like analyze_fund_performance there, `analyze_stock_performance` computes

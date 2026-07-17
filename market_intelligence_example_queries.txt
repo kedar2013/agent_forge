@@ -1,4 +1,4 @@
-Eärendil — MARKET INTELLIGENCE AGENT FAMILY
+Agent Forge — MARKET INTELLIGENCE AGENT FAMILY
 Showcase-quality example queries for testing / demoing each specialist
 (Try these in /chat, or in the Playground at /agents/<id>/playground)
 ==============================================================================

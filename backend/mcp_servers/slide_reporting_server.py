@@ -2,7 +2,7 @@
 downloadable PPTX deck: NL->SQL (direct Gemini call) -> guarded MySQL
 execution against `sales_analytics` -> rule-based chart/slide planning ->
 python-pptx + matplotlib rendering. Runs over stdio, spawned as a subprocess
-by Eärendil's mcp_tool (StdioConnectionParams), following the same pattern
+by Agent Forge's mcp_tool (StdioConnectionParams), following the same pattern
 as the other mcp_servers/*.py files.
 
 Exposes FOUR separate tools rather than one coarse tool, on purpose: the

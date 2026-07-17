@@ -154,7 +154,7 @@ export default function LoginPage({ onSuccess }: { onSuccess: () => void }) {
       <div className="w-full max-w-sm rounded-[--radius-card] border border-white/60 bg-white/70 p-8 shadow-[inset_0_1px_0_rgba(255,255,255,0.5),var(--shadow-card-hover)] backdrop-blur-xl dark:border-white/10 dark:bg-slate-900/70">
         <div className="mb-6 flex flex-col items-center gap-2 text-center">
           <Logo size="lg" withWordmark={false} />
-          <h1 className="text-lg font-semibold">Eärendil</h1>
+          <h1 className="text-lg font-semibold">Agent Forge</h1>
           <p className="text-sm text-slate-500 dark:text-slate-400">
             {tab === 'token' ? 'Admin access required' : 'Sign in with your admin, viewer, or developer account'}
           </p>

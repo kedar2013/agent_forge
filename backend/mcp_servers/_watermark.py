@@ -1,4 +1,4 @@
-"""Shared "Eärendil · Agent Forge" diagonal watermark applied to every
+"""Shared "Agent Forge" diagonal watermark applied to every
 generated report — PDF (document_export_server.py), Excel
 (document_export_server.py), and PPTX (slide_reporting_server.py) — so a
 file downloaded from chat is still traceable back to the app it came from
@@ -21,7 +21,7 @@ from PIL import Image as PILImage, ImageDraw, ImageFont
 if TYPE_CHECKING:
     from reportlab.pdfgen.canvas import Canvas
 
-WATERMARK_TEXT = "Eärendil · Agent Forge"
+WATERMARK_TEXT = "Agent Forge"
 
 # Brand purple (matches THEME["brand"] / document_export_server.py's PDF
 # title and table-header color) kept faint enough not to compete with

@@ -32,10 +32,10 @@ class User(Base):
     # Corporate/employee id (e.g. "aa12345") — admin-assigned, optional. The
     # identity domain-owned data (persona/coverage tables) key their rows by,
     # via an access_policy's resolver_config["identity_state_key"], instead
-    # of this account's own opaque `id` — lets an admin grant a real Eärendil
+    # of this account's own opaque `id` — lets an admin grant a real Agent Forge
     # user access to an existing domain dataset just by matching an id that
     # already means something outside this platform, rather than needing the
-    # domain's own data reseeded per Eärendil UUID.
+    # domain's own data reseeded per Agent Forge UUID.
     soeid: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
     role: Mapped[str] = mapped_column(String, nullable=False, default="chat_user")
     workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, default=DEFAULT_WORKSPACE_ID)

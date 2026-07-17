@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 register_byok_models()
 
 app = FastAPI(
-    title="Eärendil",
+    title="Agent Forge",
     description="The control plane for governed, auditable agentic AI — built for regulated enterprises.",
     version="1.0.0",
 )

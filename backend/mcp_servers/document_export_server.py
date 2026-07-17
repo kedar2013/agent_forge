@@ -1,6 +1,6 @@
 """A real MCP server for exporting an agent's analysis as a downloadable
 PDF or Excel file — pure local computation (reportlab / openpyxl), no
-external API. Runs over stdio, spawned as a subprocess by Eärendil's
+external API. Runs over stdio, spawned as a subprocess by Agent Forge's
 mcp_tool (StdioConnectionParams), following the same pattern as the other
 mcp_servers/*.py files.
 

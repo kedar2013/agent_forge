@@ -264,8 +264,8 @@ async def main() -> None:
     l4_companies = [c for c in companies if c["company_level"] == "L4"]
 
     # cf_user_persona/cf_user_company_coverage are keyed by SOEID (corporate
-    # id), not Eärendil's own account id — see policy_config.py's
-    # "identity_state_key": "_principal_soeid". Any real Eärendil account can
+    # id), not Agent Forge's own account id — see policy_config.py's
+    # "identity_state_key": "_principal_soeid". Any real Agent Forge account can
     # be granted one of these demo personas just by an admin setting that
     # account's SOEID (Users page) to one of the values below.
     soeids = {local_part: f"aa1{i:04d}" for i, (local_part, _persona) in enumerate(DEMO_USERS, start=1)}
@@ -311,7 +311,7 @@ async def main() -> None:
         conn.close()
 
     print("\nDemo logins (all use password: " + DEMO_PASSWORD + "), each with a SOEID an admin could")
-    print("instead assign to any real Eärendil account via the Users page to grant that persona:")
+    print("instead assign to any real Agent Forge account via the Users page to grant that persona:")
     for local_part, persona in DEMO_USERS:
         print(f"  {local_part}@{DEMO_EMAIL_DOMAIN}  soeid={soeids[local_part]}  ({persona})")
 

@@ -27,7 +27,7 @@ TABLE OF CONTENTS
 ==============================================================================
 1. OVERVIEW & PURPOSE
 ==============================================================================
-Eärendil lets someone compose a working AI agent — instructions, tools,
+Agent Forge lets someone compose a working AI agent — instructions, tools,
 reusable prompt fragments ("skills"), and sub-agents — entirely through a
 web UI, with no code required for the composition itself. The agent is
 stored as rows in Postgres, "compiled" into a real google.adk.agents.Agent
@@ -633,7 +633,7 @@ segmented row once themes passed four) in both the admin sidebar and
              (never one of the five named personality themes — those are
              always an explicit user choice)
 
-Persisted to localStorage (`Eärendil-theme`), applied via a pre-paint
+Persisted to localStorage (`agent-forge-theme`), applied via a pre-paint
 inline script in index.html (no flash of wrong theme) that sets both a
 data-theme attribute and a .dark class on <html> — every dark-family theme
 (Dark, Midnight, Forest) gets the class, so every existing Tailwind dark:
@@ -660,7 +660,7 @@ explicitly styled, checkbox ticks, scrollbars) is driven by the CSS
 (:root.dark { color-scheme: dark }) rather than left as the OS-tracking
 `light dark` default — see bug #14 in section 14 for why this mattered.
 
-Branding: "Developed by Kedar's Eärendil Studio" via a shared StudioCredit
+Branding: "Developed by Kedar's Agent Forge Studio" via a shared StudioCredit
 component (sidebar footer, all auth pages, /chat composer footer, plus a
 <meta name="author"> tag). A Help (?) button opens an About panel:
 capability summary, tech stack badges, keyboard shortcuts, studio credit.

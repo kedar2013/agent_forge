@@ -1,6 +1,6 @@
 """A real MCP server for Indian mutual fund analysis — mfapi.in (free, no API
 key, daily-updated NAV data sourced from AMFI). Runs over stdio, spawned as a
-subprocess by Eärendil's mcp_tool (StdioConnectionParams).
+subprocess by Agent Forge's mcp_tool (StdioConnectionParams).
 
 Unlike a thin passthrough, `analyze_fund_performance` computes real return
 figures (1M/3M/6M/1Y/3Y/5Y, 52-week high/low) from the raw NAV history rather

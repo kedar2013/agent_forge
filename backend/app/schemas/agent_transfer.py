@@ -4,7 +4,7 @@ from pydantic import BaseModel
 
 from app.schemas.skills import FewShotExample
 
-EXPORT_FORMAT = "Eärendil-agent-export-v1"
+EXPORT_FORMAT = "agent-forge-export-v1"
 
 
 class ExportedTool(BaseModel):
