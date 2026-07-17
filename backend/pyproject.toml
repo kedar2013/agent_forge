@@ -22,7 +22,13 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.111.0",
     "uvicorn[standard]>=0.30.0",
-    "google-adk>=2.4.0,<3.0.0",
+    # Pinned exact (not a >=/< range): 2.5.0 renamed/dropped the McpToolset
+    # alias this app imports (app/tool_registry/mcp_tool.py) in favor of
+    # MCPToolset-only, which only surfaced as a Railway build-time crash
+    # since that fresh install resolved to 2.5.0 while local dev stayed on
+    # whatever was installed when 2.4.0 was current. Bump deliberately, not
+    # by drift.
+    "google-adk==2.4.0",
     # Claude support: litellm is what google.adk.models.lite_llm.LiteLlm needs
     # to route an agent's model= at Anthropic instead of Gemini (see
     # agent_runtime/builder.py); anthropic is the official SDK used directly
