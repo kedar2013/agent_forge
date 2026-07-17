@@ -63,7 +63,7 @@ export default function SkillsPage() {
         </div>
       )}
 
-      <Modal open={showForm} onClose={() => setShowForm(false)} title="New Skill" maxWidth="max-w-xl">
+      <Modal open={showForm} onClose={() => setShowForm(false)} title="New Skill" maxWidth="max-w-3xl">
         <SkillForm onDone={() => setShowForm(false)} />
       </Modal>
     </div>

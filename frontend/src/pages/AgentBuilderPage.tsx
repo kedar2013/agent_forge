@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { FlaskConical, Rocket, Users } from 'lucide-react'
+import { Bot, FlaskConical, Rocket, Users } from 'lucide-react'
 import { toast } from 'sonner'
 import {
   useAddAgentCollaborator,
@@ -24,6 +24,7 @@ import SkillPicker from '../components/agents/SkillPicker'
 import SubAgentAttachPanel from '../components/agents/SubAgentAttachPanel'
 import ToolAttachPanel from '../components/agents/ToolAttachPanel'
 import ManageCollaboratorsModal from '../components/collaborators/ManageCollaboratorsModal'
+import PreviewCardShell from '../components/creation/PreviewCardShell'
 import { AGENT_STATUS_TONE } from '../lib/badgeTones'
 import { fingerprint, hasPassedTest, markTesting } from '../lib/testGate'
 import { getStoredRole, getUserEmail } from '../lib/auth'
@@ -254,60 +255,89 @@ export default function AgentBuilderPage() {
   }
 
   if (isNew) {
+    const modelLabel = MODEL_OPTIONS.find((o) => o.value === draft.model)?.label ?? draft.model
     return (
-      <div className="max-w-xl">
+      <div className="max-w-4xl">
         <h1 className="mb-4 text-xl font-semibold">New Agent</h1>
-        <Card>
-          <form onSubmit={handleCreate} className="space-y-3">
-            <Input
-              label="Name"
-              hideLabel={false}
-              required
-              value={draft.name}
-              onChange={(e) => setDraft({ ...draft, name: e.target.value })}
-            />
-            <Input
-              label="Description"
-              hideLabel={false}
-              value={draft.description}
-              onChange={(e) => setDraft({ ...draft, description: e.target.value })}
-            />
-            <Textarea
-              label="Base instruction"
-              hideLabel={false}
-              required
-              className="h-40"
-              value={draft.base_instruction}
-              onChange={(e) => setDraft({ ...draft, base_instruction: e.target.value })}
-            />
-            <div className="flex gap-3">
-              <div className="flex-1">
-                <Select
-                  label="Model"
-                  hideLabel={false}
-                  value={draft.model}
-                  onChange={(e) => setDraft({ ...draft, model: e.target.value })}
-                  options={MODEL_OPTIONS}
-                />
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_280px]">
+          <Card>
+            <form onSubmit={handleCreate} className="space-y-3">
+              <Input
+                label="Name"
+                hideLabel={false}
+                required
+                value={draft.name}
+                onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+              />
+              <Input
+                label="Description"
+                hideLabel={false}
+                value={draft.description}
+                onChange={(e) => setDraft({ ...draft, description: e.target.value })}
+              />
+              <Textarea
+                label="Base instruction"
+                hideLabel={false}
+                required
+                className="h-40"
+                value={draft.base_instruction}
+                onChange={(e) => setDraft({ ...draft, base_instruction: e.target.value })}
+              />
+              <div className="flex gap-3">
+                <div className="flex-1">
+                  <Select
+                    label="Model"
+                    hideLabel={false}
+                    value={draft.model}
+                    onChange={(e) => setDraft({ ...draft, model: e.target.value })}
+                    options={MODEL_OPTIONS}
+                  />
+                </div>
+                <div className="w-32">
+                  <Input
+                    label="Temperature"
+                    hideLabel={false}
+                    type="number"
+                    step="0.1"
+                    min="0"
+                    max="2"
+                    value={draft.temperature}
+                    onChange={(e) => setDraft({ ...draft, temperature: Number(e.target.value) })}
+                  />
+                </div>
               </div>
-              <div className="w-32">
-                <Input
-                  label="Temperature"
-                  hideLabel={false}
-                  type="number"
-                  step="0.1"
-                  min="0"
-                  max="2"
-                  value={draft.temperature}
-                  onChange={(e) => setDraft({ ...draft, temperature: Number(e.target.value) })}
-                />
-              </div>
+              <Button type="submit" isPending={createAgent.isPending} loadingLabel="Creating…">
+                Create agent
+              </Button>
+            </form>
+          </Card>
+
+          <PreviewCardShell
+            icon={Bot}
+            isActive={draft.name.trim().length > 0}
+            title={draft.name || 'Your agent'}
+            subtitle={draft.description || undefined}
+            emptyHint="Your agent…"
+          >
+            <div className="mt-4 flex flex-wrap gap-1.5">
+              <Badge tone="brand">{modelLabel}</Badge>
+              <Badge tone="neutral">temp {draft.temperature}</Badge>
             </div>
-            <Button type="submit" isPending={createAgent.isPending} loadingLabel="Creating…">
-              Create agent
-            </Button>
-          </form>
-        </Card>
+            {draft.base_instruction.trim().length > 0 && (
+              <div className="animate-canvas-reveal mt-4">
+                <div className="mb-1.5 text-[11px] font-semibold tracking-wide text-slate-400 uppercase">
+                  Instructions
+                </div>
+                <p className="max-h-32 overflow-y-auto rounded-md bg-slate-50 p-2.5 text-xs leading-relaxed whitespace-pre-wrap text-slate-600 dark:bg-slate-900/40 dark:text-slate-300">
+                  {draft.base_instruction}
+                </p>
+              </div>
+            )}
+            {draft.name.trim().length === 0 && (
+              <p className="mt-3 text-xs text-slate-400">Fill in the form and watch your agent take shape here.</p>
+            )}
+          </PreviewCardShell>
+        </div>
       </div>
     )
   }

@@ -57,7 +57,7 @@ export default function SkillCard({ skill, compact = false }: { skill: Skill; co
         entityLabel="skill"
       />
 
-      <Modal open={editing} onClose={() => setEditing(false)} title={`Edit "${skill.name}"`} maxWidth="max-w-xl">
+      <Modal open={editing} onClose={() => setEditing(false)} title={`Edit "${skill.name}"`} maxWidth="max-w-3xl">
         <SkillForm skill={skill} onDone={() => setEditing(false)} />
       </Modal>
 

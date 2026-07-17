@@ -35,7 +35,7 @@ export default function ToolCard({ tool, compact = false }: { tool: Tool; compac
         entityLabel="tool"
       />
 
-      <Modal open={editing} onClose={() => setEditing(false)} title={`Edit "${tool.name}"`} maxWidth="max-w-xl">
+      <Modal open={editing} onClose={() => setEditing(false)} title={`Edit "${tool.name}"`} maxWidth="max-w-3xl">
         <ToolForm tool={tool} onDone={() => setEditing(false)} />
       </Modal>
 

@@ -65,7 +65,7 @@ export default function ToolsPage() {
         </div>
       )}
 
-      <Modal open={showForm} onClose={() => setShowForm(false)} title="New Tool" maxWidth="max-w-xl">
+      <Modal open={showForm} onClose={() => setShowForm(false)} title="New Tool" maxWidth="max-w-3xl">
         <ToolForm onDone={() => setShowForm(false)} />
       </Modal>
     </div>

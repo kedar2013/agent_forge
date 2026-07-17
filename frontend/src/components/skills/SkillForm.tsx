@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Users } from 'lucide-react'
+import { Sparkles, Users } from 'lucide-react'
 import { toast } from 'sonner'
 import {
   useAddSkillCollaborator,
@@ -10,7 +10,9 @@ import {
 } from '../../api/skills'
 import type { FewShotExample, Skill } from '../../api/types'
 import ManageCollaboratorsModal from '../collaborators/ManageCollaboratorsModal'
+import PreviewCardShell from '../creation/PreviewCardShell'
 import { getStoredRole, getUserEmail } from '../../lib/auth'
+import Badge from '../ui/Badge'
 import Button from '../ui/Button'
 import Input from '../ui/Input'
 import Textarea from '../ui/Textarea'
@@ -60,70 +62,110 @@ export default function SkillForm({ skill, onDone }: { skill?: Skill; onDone: ()
     }
   }
 
+  const tagList = tags.split(',').map((t) => t.trim()).filter(Boolean)
+
   return (
-    <form onSubmit={handleSubmit} className="space-y-4">
-      <Input
-        label="Name"
-        hideLabel={false}
-        required
-        value={name}
-        onChange={(e) => setName(e.target.value)}
-      />
-
-      <Textarea
-        label="Instruction text"
-        hideLabel={false}
-        required
-        className="h-32 font-mono"
-        value={instructionText}
-        onChange={(e) => setInstructionText(e.target.value)}
-        placeholder="e.g. Always explain answers using grade-8-level vocabulary and short sentences."
-      />
-
-      <Input
-        label="Tags (comma-separated)"
-        hideLabel={false}
-        value={tags}
-        onChange={(e) => setTags(e.target.value)}
-        placeholder="formatting, tone"
-      />
-
-      <FewShotEditor value={examples} onChange={setExamples} />
-
-      <div className="flex items-center justify-between gap-2 border-t border-slate-100 pt-4 dark:border-slate-800">
-        {canManageAccess ? (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            leftIcon={<Users size={14} />}
-            onClick={() => setShowCollaborators(true)}
-          >
-            Manage access
-          </Button>
-        ) : (
-          <span />
-        )}
-        <div className="flex gap-2">
-          <Button variant="outline" tone="neutral" onClick={onDone}>
-            Cancel
-          </Button>
-          <Button type="submit" isPending={pending} loadingLabel="Saving…">
-            {isEditing ? 'Save changes' : 'Create skill'}
-          </Button>
-        </div>
-      </div>
-
-      {showCollaborators && skill && (
-        <ManageCollaboratorsModal
-          resourceLabel="skill"
-          collaborators={collaborators}
-          isLoading={collaboratorsLoading}
-          addMutation={addCollaborator}
-          onRemove={(email) => removeCollaborator.mutate(email)}
-          onClose={() => setShowCollaborators(false)}
+    <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_240px]">
+      <form onSubmit={handleSubmit} className="space-y-4">
+        <Input
+          label="Name"
+          hideLabel={false}
+          required
+          value={name}
+          onChange={(e) => setName(e.target.value)}
         />
-      )}
-    </form>
+
+        <Textarea
+          label="Instruction text"
+          hideLabel={false}
+          required
+          className="h-32 font-mono"
+          value={instructionText}
+          onChange={(e) => setInstructionText(e.target.value)}
+          placeholder="e.g. Always explain answers using grade-8-level vocabulary and short sentences."
+        />
+
+        <Input
+          label="Tags (comma-separated)"
+          hideLabel={false}
+          value={tags}
+          onChange={(e) => setTags(e.target.value)}
+          placeholder="formatting, tone"
+        />
+
+        <FewShotEditor value={examples} onChange={setExamples} />
+
+        <div className="flex items-center justify-between gap-2 border-t border-slate-100 pt-4 dark:border-slate-800">
+          {canManageAccess ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              leftIcon={<Users size={14} />}
+              onClick={() => setShowCollaborators(true)}
+            >
+              Manage access
+            </Button>
+          ) : (
+            <span />
+          )}
+          <div className="flex gap-2">
+            <Button variant="outline" tone="neutral" onClick={onDone}>
+              Cancel
+            </Button>
+            <Button type="submit" isPending={pending} loadingLabel="Saving…">
+              {isEditing ? 'Save changes' : 'Create skill'}
+            </Button>
+          </div>
+        </div>
+
+        {showCollaborators && skill && (
+          <ManageCollaboratorsModal
+            resourceLabel="skill"
+            collaborators={collaborators}
+            isLoading={collaboratorsLoading}
+            addMutation={addCollaborator}
+            onRemove={(email) => removeCollaborator.mutate(email)}
+            onClose={() => setShowCollaborators(false)}
+          />
+        )}
+      </form>
+
+      <PreviewCardShell
+        icon={Sparkles}
+        isActive={name.trim().length > 0}
+        title={name || 'Your skill'}
+        emptyHint="Your skill…"
+      >
+        {tagList.length > 0 && (
+          <div className="animate-canvas-reveal mt-4 flex flex-wrap gap-1.5">
+            {tagList.map((tag) => (
+              <Badge key={tag} tone="violet">
+                {tag}
+              </Badge>
+            ))}
+          </div>
+        )}
+        {instructionText.trim().length > 0 && (
+          <div className="animate-canvas-reveal mt-4">
+            <div className="mb-1.5 text-[11px] font-semibold tracking-wide text-slate-400 uppercase">
+              Instructions
+            </div>
+            <p className="max-h-28 overflow-y-auto rounded-md bg-slate-50 p-2.5 text-xs leading-relaxed whitespace-pre-wrap text-slate-600 dark:bg-slate-900/40 dark:text-slate-300">
+              {instructionText}
+            </p>
+          </div>
+        )}
+        {examples.some((ex) => ex.input || ex.output) && (
+          <p className="animate-canvas-reveal mt-3 text-xs text-slate-500 dark:text-slate-400">
+            {examples.filter((ex) => ex.input || ex.output).length} few-shot example
+            {examples.filter((ex) => ex.input || ex.output).length === 1 ? '' : 's'}
+          </p>
+        )}
+        {name.trim().length === 0 && (
+          <p className="mt-3 text-xs text-slate-400">Fill in the form and watch your skill take shape here.</p>
+        )}
+      </PreviewCardShell>
+    </div>
   )
 }
