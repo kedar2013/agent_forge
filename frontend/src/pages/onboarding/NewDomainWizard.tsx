@@ -1,4 +1,5 @@
 import { useNavigate } from 'react-router-dom'
+import LivingAgentCanvas from '../../components/onboarding/LivingAgentCanvas'
 import Stepper from '../../components/ui/Stepper'
 import { GuideProvider, GuideRail } from '../../components/ui/FieldGuide'
 import AccessStep from './steps/AccessStep'
@@ -31,7 +32,25 @@ export default function NewDomainWizard() {
 
         <Stepper steps={WIZARD_STEPS} currentIndex={wizard.step} className="mb-6 lg:hidden" />
 
-        <div className="grid gap-8 lg:grid-cols-[200px_minmax(0,1fr)_300px]">
+        {/* On mobile the live canvas sits above the form (the 3-column grid
+            below collapses to one column there); on lg+ it moves into the
+            right-hand column alongside the guide rail instead. */}
+        <div className="mb-6 lg:hidden">
+          <LivingAgentCanvas
+            domainName={wizard.domainName}
+            domainDescription={wizard.domainDescription}
+            policy={wizard.policy}
+            entities={wizard.entities}
+            tools={wizard.tools}
+            agentName={wizard.agentName}
+            agentDescription={wizard.agentDescription}
+            agentInstruction={wizard.agentInstruction}
+            smokeResult={wizard.smokeResult}
+            publishedVersion={wizard.publishedVersion}
+          />
+        </div>
+
+        <div className="grid gap-8 lg:grid-cols-[200px_minmax(0,1fr)_320px]">
           <div className="hidden lg:block">
             <div className="sticky top-4">
               <Stepper steps={WIZARD_STEPS} currentIndex={wizard.step} orientation="vertical" />
@@ -122,7 +141,19 @@ export default function NewDomainWizard() {
             )}
           </div>
 
-          <div className="hidden lg:block">
+          <div className="hidden space-y-6 lg:block">
+            <LivingAgentCanvas
+              domainName={wizard.domainName}
+              domainDescription={wizard.domainDescription}
+              policy={wizard.policy}
+              entities={wizard.entities}
+              tools={wizard.tools}
+              agentName={wizard.agentName}
+              agentDescription={wizard.agentDescription}
+              agentInstruction={wizard.agentInstruction}
+              smokeResult={wizard.smokeResult}
+              publishedVersion={wizard.publishedVersion}
+            />
             <GuideRail />
           </div>
         </div>
