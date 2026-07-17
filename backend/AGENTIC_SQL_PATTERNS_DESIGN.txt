@@ -1,0 +1,326 @@
+================================================================================
+DESIGN DOC: Agentic Data-Retrieval Patterns
+Self-Healing Execution Loop + Query Decomposition for Complex Analytics
+================================================================================
+
+Status:        Implemented and live-verified
+Domain used:    revenue_and_returns (MySQL) — rr_product_master,
+                rr_revenue_returns_monthly (real seeded data)
+Related docs:   SECURITY.md (SQL validation posture), HOSTING.md (deployment)
+
+
+--------------------------------------------------------------------------------
+1. WHAT THIS IS
+--------------------------------------------------------------------------------
+
+Two standard agentic-AI techniques for text-to-SQL, implemented end to end as
+real, published, working agents in this platform (not a prototype/notebook):
+
+  1. Self-Healing Execution Loop (error reflection)
+     A query that fails doesn't surface a raw DB error to the user — the
+     failure is fed back to the model, which rewrites the query and tries
+     again, capped at a fixed number of attempts.
+
+  2. Query Decomposition for Complex Analytics
+     A compound question ("compare X to Y") is split into independent
+     sub-queries, each run and stored separately, then combined into one
+     final answer by a dedicated synthesis step.
+
+Both patterns are built from two new reusable tool types plus three agents
+that consume them. Nothing here is hypothetical — every component below was
+tested against the real `revenue_and_returns` MySQL database and the real
+Playground/Chat API.
+
+
+--------------------------------------------------------------------------------
+2. COMPONENTS CREATED
+--------------------------------------------------------------------------------
+
+2.1  Tool: self_healing_sql_tool
+     File:   app/tool_registry/self_healing_sql_tool.py
+     Class:  SelfHealingSqlTool(ConfigDrivenTool)
+
+     What it does:
+       - Takes one argument, `sql` — a single read-only SELECT statement,
+         written by the LLM itself (no fixed query template).
+       - Validates it structurally via a real sqlglot AST (not regex):
+           * exactly one statement, must be SELECT/WITH
+           * every referenced table must be in the tool's configured
+             allow-list (rr_product_master, rr_revenue_returns_monthly)
+           * a forbidden-function denylist blocks LOAD_FILE/SLEEP/etc,
+             reusing the same denylist app/tool_registry/data_query_tool.py
+             already uses — this is the same AST-based defense built during
+             the earlier security-hardening pass, not a new/separate
+             mechanism.
+       - Runs the query read-only (START TRANSACTION READ ONLY, rolled back
+         after SELECT) against MySQL via a pooled pymysql connection.
+       - NEVER raises on failure. Every failure path — a parse error, a
+         disallowed table, a forbidden function, or a real MySQL execution
+         error — is returned as the tool's own JSON result:
+             {"error": "<the real error text> (attempt N/max). Review the
+              error message, correct the query, and call this tool again."}
+         This is the entire self-healing mechanism: ADK's function-calling
+         loop already re-invokes the model with the tool's result as
+         context, so the model sees the exact DB error (e.g. MySQL 1054
+         "Unknown column 'rev' in 'field list'") on its very next turn and
+         can correct the query itself. No custom retry loop was written —
+         this is standard tool-calling behavior, just with a tool that's
+         honest about failures instead of swallowing them.
+       - Retry cap: a counter lives in `tool_context.state`, keyed
+         `_self_healing_retries:<tool name>` (scoped per tool so two
+         self-healing tools on one agent tree don't share a counter).
+         Incremented on every failure. Once it exceeds `max_retries`
+         (config, default 5), the tool stops returning "try again" and
+         instead returns:
+             {"error": "Maximum retry attempts (5) reached ... Stop
+              retrying. Tell the user the data could not be retrieved ...",
+              "retries_exhausted": true}
+         The counter resets to 0 on the next successful query, so a later,
+         unrelated question in the same session starts with a fresh budget.
+         This cap is enforced by the TOOL, not by trusting the model to
+         count its own attempts — a confused model that keeps calling the
+         tool anyway just keeps getting told to stop.
+       - Optional second argument, `scratchpad_slot` (one of "scratchpad_1"
+         / "scratchpad_2" / "scratchpad_3"). If present, a SUCCESSFUL
+         result is ALSO written to `tool_context.state[scratchpad_slot]`,
+         in addition to being returned directly to the caller. This is
+         the hook query decomposition (component 2.3) uses — self-healing
+         and decomposition compose for free through the same tool.
+
+     Config shape (as seeded):
+         {
+           "connection_env_prefix": "REVENUE_RETURNS_MYSQL",
+           "allowed_tables": ["rr_product_master", "rr_revenue_returns_monthly"],
+           "max_rows": 200,
+           "max_retries": 5
+         }
+
+2.2  Tool: read_scratchpad_tool
+     File:   app/tool_registry/read_scratchpad_tool.py
+     Class:  ReadScratchpadTool(ConfigDrivenTool)
+
+     What it does:
+       - Takes no arguments.
+       - Reads `scratchpad_1`, `scratchpad_2`, `scratchpad_3` out of
+         `tool_context.state`, returns whichever ones are actually
+         present (`.get(slot)`, never a hard key lookup).
+       - This is a TOOL CALL, not ADK `{state_key}` instruction templating
+         (which this app does use elsewhere — see chat_api's
+         _DEFAULT_CHAT_STATE) — deliberately, because templating raises a
+         hard KeyError if a referenced key was never set. A question with
+         only 2 parts would never fill scratchpad_3, and a template
+         referencing it would crash. A tool can just skip what wasn't used.
+       - Has zero database access and zero other capability — an agent
+         that only has this tool physically cannot query anything itself.
+
+2.3  Agent: self_healing_revenue_analyst  (standalone — Use Case 1)
+     Seeded by: scripts/seed_agentic_sql_patterns.py
+
+     - One tool: self_healing_sql_tool (as revenue_self_healing_sql).
+     - Instruction gives it the exact schema of both tables (columns,
+       types, what load_id means) and tells it: write one SELECT per
+       question, don't set scratchpad_slot, read tool errors and correct
+       the query, stop and report to the user once retries_exhausted
+       comes back, never fabricate numbers.
+     - Published standalone — selectable directly in Playground/Chat.
+
+2.4  Agent tree: revenue_query_orchestrator + revenue_query_synthesizer
+     (Use Case 2)
+     Seeded by: scripts/seed_agentic_sql_patterns.py
+
+     revenue_query_orchestrator (root):
+       - Same self_healing_sql_tool as 2.3, but instructed differently:
+           * A single-part question -> answer it directly, one tool call,
+             no scratchpad_slot, no transfer.
+           * A 2-or-3-part question (e.g. "compare A's revenue to B's
+             return rate") -> decompose into that many independent SELECT
+             statements, call the tool once per part, giving each call a
+             DIFFERENT scratchpad_slot (scratchpad_1, then scratchpad_2,
+             then scratchpad_3 if needed). Each call still self-heals
+             independently if it fails.
+           * Once every part has succeeded, silently call ADK's built-in
+             transfer_to_agent to hand off to revenue_query_synthesizer —
+             never write the final answer itself, never narrate the
+             handoff in text.
+
+     revenue_query_synthesizer (sub-agent of the orchestrator):
+       - One tool: read_scratchpad_tool. NO SQL tool — it cannot query the
+         database even if it wanted to; that's enforced by what tools it
+         has, not just by instruction wording.
+       - Instruction: call read_scratchpad_tool first, then write ONE
+         answer that explicitly attributes each figure to which part of
+         the original question it answers (not two disconnected tables
+         pasted together) — actually compare/connect them the way the
+         question asked. If the scratchpad came back empty or a part had
+         zero rows, say so plainly rather than inventing a number.
+       - The sub-agent relationship is a real AgentSubagent row (see
+         app/models/agents.py) attached BEFORE the orchestrator's first
+         publish, so the published snapshot's sub_agents list is non-empty
+         from the start (a snapshot freezes sub_agents at publish time —
+         attaching after publishing would ship an orchestrator with no
+         transfer target). ADK auto-injects the transfer_to_agent function
+         once sub_agents is non-empty; nothing in this app builds that
+         mechanism by hand, only the instruction wording that tells the
+         model to use it.
+
+
+--------------------------------------------------------------------------------
+3. HOW A REQUEST FLOWS THROUGH EACH PATTERN
+--------------------------------------------------------------------------------
+
+3.1  Self-healing (self_healing_revenue_analyst)
+
+     User: "What was the gross revenue for Apparel in July 2026?"
+       -> model writes SELECT SUM(gross_revenue) FROM
+          rr_revenue_returns_monthly WHERE business_unit='Apparel' AND
+          load_id=202607
+       -> tool validates (AST), executes, returns rows
+       -> model presents the answer
+
+     If the model had instead written a nonexistent column name:
+       -> tool's AST parse succeeds (syntactically valid SQL) but MySQL
+          execution fails: "Unknown column 'rev' in 'field list'"
+       -> tool returns {"error": "... (attempt 1/5) ... call this tool
+          again."}
+       -> model reads the error, sees the real column names it was given
+          in its own instruction, corrects the query, calls the tool again
+       -> succeeds; retry counter resets to 0
+
+     Live-verified variant actually observed in testing: the model asked
+     for business_unit="Apparel" as if it were a `category` value (it
+     is actually a `business_unit`), got zero rows back (not an error —
+     MySQL doesn't error on a filter that matches nothing), and
+     self-corrected by querying `SELECT DISTINCT category` to discover the
+     real categories, then told the user plainly that "Apparel" wasn't a
+     category rather than fabricating a number. This is the same
+     read-the-tool-output-and-adapt behavior, one level broader than a
+     hard SQL error.
+
+3.2  Decomposition (revenue_query_orchestrator -> revenue_query_synthesizer)
+
+     User: "How did Apparel's July 2026 revenue compare to Office
+     Supplies' July 2026 return rate?"
+
+       orchestrator:
+         1. Recognizes two independent parts.
+         2. Tool call 1: SELECT SUM(gross_revenue) ... WHERE
+            business_unit='Apparel' AND load_id=202607,
+            scratchpad_slot="scratchpad_1"
+              -> tool_context.state["scratchpad_1"] = {row_count:1,
+                 rows:[{...}], ...}
+         3. Tool call 2: SELECT AVG(return_rate_pct) ... WHERE
+            business_unit='Office Supplies' AND load_id=202607,
+            scratchpad_slot="scratchpad_2"
+              -> tool_context.state["scratchpad_2"] = {...}
+         4. transfer_to_agent(revenue_query_synthesizer)  [silent]
+
+       synthesizer (now active in the same session):
+         5. Calls read_query_scratchpad() -> {"scratchpad_1": {...},
+            "scratchpad_2": {...}}
+         6. Writes: "In July 2026, the Apparel business unit's gross
+            revenue was $1,141,410.47. For the same period, the Office
+            Supplies business unit had an average return rate of 9.27%."
+
+     This exact exchange (with these exact numbers) was captured live
+     against the real database during implementation — see the tool_calls
+     trace: two revenue_self_healing_sql calls with distinct
+     scratchpad_slot values, followed by one read_query_scratchpad call,
+     confirming the transfer actually happened (only the synthesizer has
+     that tool).
+
+
+--------------------------------------------------------------------------------
+4. KEY DESIGN DECISIONS AND WHY
+--------------------------------------------------------------------------------
+
+- One tool serves both use cases (self_healing_sql_tool), not two.
+  Self-healing and decomposition are orthogonal concerns — a
+  decomposition sub-query should ALSO self-heal if it fails, so bolting
+  scratchpad support onto the healing tool as an optional argument means
+  every sub-query in Use Case 2 automatically gets Use Case 1's retry
+  behavior for free, with no duplicated validation/execution code.
+
+- The retry cap lives in tool state, not in the model's own counting.
+  A model can always be asked to "count your attempts," but nothing
+  stops it from miscounting or ignoring the instruction. The tool tracks
+  its own counter server-side and refuses to cooperate past the cap
+  regardless of what the model does next — the safety property doesn't
+  depend on the model being well-behaved.
+
+- Scratchpad is a tool call, not {state_key} instruction templating.
+  ADK instruction templating is used elsewhere in this app (grade/
+  language/subject for StudyBuddy), but it hard-fails with KeyError on a
+  missing key. A 2-part question never fills scratchpad_3; a template
+  referencing it unconditionally would crash the synthesizer on every
+  2-part question. A tool doing `.get(slot)` degrades gracefully instead.
+
+- The synthesizer has no SQL tool at all — not just an instruction not
+  to use one. If the model ever ignored its instructions and tried to
+  invent a query, there's no function declaration for it to call. The
+  constraint is structural, not just prompted.
+
+- SQL validation is reused, not reimplemented. self_healing_sql_tool
+  imports _FORBIDDEN_NODE_TYPES and _forbidden_function_call directly
+  from app/tool_registry/data_query_tool.py — the same AST-based
+  SELECT-only / forbidden-function checks already audited and fixed
+  during the earlier security-hardening pass apply here unchanged. A
+  new SQL-executing tool did not get a chance to reintroduce an old bug.
+
+- Read-only enforcement is defense in depth, not just app-level.
+  Every query runs inside `START TRANSACTION READ ONLY`, then rolls
+  back — so even if a query somehow got past the AST validation, MySQL
+  itself would refuse to let it write anything.
+
+
+--------------------------------------------------------------------------------
+5. FILES TOUCHED / CREATED
+--------------------------------------------------------------------------------
+
+  New:
+    app/tool_registry/self_healing_sql_tool.py     (tool implementation)
+    app/tool_registry/read_scratchpad_tool.py       (tool implementation)
+    scripts/seed_agentic_sql_patterns.py            (creates/publishes the
+                                                      3 agents + 2 tool rows)
+    alembic/versions/1c434e403b77_*.py              (DB check-constraint
+                                                      migration for the two
+                                                      new tool_type values)
+
+  Modified:
+    app/tool_registry/factory.py     (+2 branches: build_tool() now
+                                       recognizes both new tool_types)
+    app/models/tools.py              (+2 entries in TOOL_TYPES)
+    app/schemas/tools.py             (+2 entries in the ToolType Literal)
+
+
+--------------------------------------------------------------------------------
+6. HOW TO USE / RE-SEED
+--------------------------------------------------------------------------------
+
+  Already seeded and published in the live dev database. To re-seed from
+  scratch (e.g. after a DB reset), from backend/:
+
+      python -m alembic upgrade head
+      python scripts/seed_agentic_sql_patterns.py
+
+  To wipe and rebuild:
+
+      python scripts/seed_agentic_sql_patterns.py --reset
+      python scripts/seed_agentic_sql_patterns.py
+
+  Try it in Playground or Chat:
+    - "self_healing_revenue_analyst" — ask any single revenue/returns
+      question, e.g. "What was the return rate for Office Supplies in
+      June 2026?"
+    - "revenue_query_orchestrator" — ask a compound question, e.g. "How
+      does Apparel's revenue compare to Home & Kitchen's units sold, both
+      for July 2026?"
+
+  NOTE: if you edit either tool's .py file while a `--reload` dev server
+  is already running, confirm the reload actually took effect (check the
+  server's own startup log timestamp) before assuming a bug is in the
+  code rather than in a stale worker process — this bit us once during
+  development: a long-running reloader had the old factory.py cached in
+  memory and returned a generic 500 ("Unknown tool_type") for both new
+  agents until the server was restarted.
+
+================================================================================

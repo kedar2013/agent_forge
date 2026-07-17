@@ -1,0 +1,105 @@
+Eärendil — MARKET INTELLIGENCE AGENT FAMILY
+Showcase-quality example queries for testing / demoing each specialist
+(Try these in /chat, or in the Playground at /agents/<id>/playground)
+==============================================================================
+
+0. SHOWCASE — the best single queries to demo the app's depth
+------------------------------------------------------------------------------
+- I want to start an SIP of 10,000 rupees a month. Based on historical data
+  and current trends, which sectors should I broadly look at?
+    -> real sector-by-sector performance table (3M/6M/1Y/3Y), ranked, with
+       an honest "sector leadership rotates" caveat — not a stock tip.
+- Give me a thorough analysis and prediction for Nippon India Small Cap Fund.
+    -> trailing returns AND a real statistical trend/volatility/NAV
+       projection (6mo/12mo), clearly labeled as a projection, not a promise.
+- If I invest 15,000/month for 5 years in HDFC Small Cap Fund, what could
+  that grow to?
+    -> a real compound-interest SIP projection based on the fund's own
+       trailing CAGR — total invested vs. projected value vs. projected gain.
+- Tell me about Infosys — overview, financials, analyst sentiment, and
+  recent filings.
+    -> pulls together company profile, fundamentals, quarterly earnings,
+       analyst upgrades/downgrades, and real SEC filing links in one answer.
+- Give me a comparison between Nippon India Small Cap and Quant Small Cap
+  fund.
+    -> resolves both scheme codes itself and returns a clean side-by-side
+       markdown table — no back-and-forth needed.
+- Compare gold to the S&P 500 this year.
+    -> shows the app's honest limits: answers the part it can and says
+       plainly what it doesn't cover, instead of guessing.
+
+1. MARKET INTELLIGENCE (orchestrator — routes to every specialist below)
+------------------------------------------------------------------------------
+- What can you help me with?
+- I want to check on my investments — where do I start?
+- Tell me about gold prices, then Bitcoin's price too.
+- What's the difference between how the Nifty 50 and Nifty 100 have done
+  this year?
+- I'm new here — what kinds of financial questions can you answer?
+
+2. STOCK_MARKET_ANALYST (stocks, ETFs, indices, and company research)
+------------------------------------------------------------------------------
+- What's Apple's stock price right now, and how has it performed this year?
+- What's the current price of the Nifty 50 index, and the Nifty 100 too?
+- Compare Reliance Industries' 1-month and 1-year returns.
+- Tell me about Tesla as a company — what do they do, and what's their
+  market cap and P/E ratio?
+- What's Microsoft's revenue trend over the last 4 quarters?
+- How has Infosys done on quarterly earnings — beating or missing estimates?
+- What's the current analyst sentiment on Nvidia — are they mostly bullish?
+- Any recent SEC filings for Apple?
+- What's the latest news on Tata Motors?
+- Give me a full research summary on Amazon — profile, fundamentals,
+  earnings, sentiment, and news, all together.
+
+3. CRYPTO_ANALYST (cryptocurrency — CoinGecko)
+------------------------------------------------------------------------------
+- What's Bitcoin trading at right now, and how has it done over the past
+  6 months?
+- What coins are trending right now?
+- Give me Ethereum's price and market cap in INR.
+- Compare Bitcoin's and Solana's trailing 1-year returns.
+- What's Bitcoin's 52-week high and low?
+
+4. FOREX_METALS_ANALYST (currency exchange + precious metals)
+------------------------------------------------------------------------------
+- What's the USD to INR exchange rate today, and how has it trended this
+  year?
+- Convert 2,000 USD to INR.
+- What's the current spot price for gold and silver?
+- Has the dollar gotten stronger or weaker against the rupee this year?
+- Give me spot prices for all four precious metals you track.
+
+5. FUND_ANALYST_AGENT (Indian mutual funds — deep analysis & predictions)
+------------------------------------------------------------------------------
+- How has the HDFC Small Cap Fund performed over the last 5 years?
+- Give me a thorough analysis and prediction for Quant Small Cap Fund —
+  include volatility and a 12-month outlook.
+- What's the maximum drawdown Parag Parikh Flexi Cap Fund has seen recently?
+- Compare Nippon India Small Cap and Quant Small Cap on both historical
+  performance and projected trend.
+- I'm considering an SIP of 5,000/month for 10 years in an index fund —
+  project what that could become.
+- Based on current trends, which sectors have led over the last year, and
+  which have lagged?
+- Search for HDFC's small cap fund options and tell me the scheme codes.
+
+==============================================================================
+NOTES
+- Every specialist responds with data/analysis only — they're instructed not
+  to give buy/sell/hold investment advice, and will say so plainly if asked
+  directly (e.g. "should I buy Bitcoin?" or "which fund should I pick?").
+- Trend/volatility/SIP projections from fund_analyst_agent are real compound-
+  interest math run on real historical NAV data — always presented with an
+  explicit "this is a projection, not a guarantee" caveat.
+- crypto_analyst's trend analysis is limited to a 1-year lookback (CoinGecko's
+  free tier doesn't allow longer daily history without a paid API key).
+- Company research coverage is honest about its limits: competitors, ESG
+  scores, and credit ratings have no reliable free data source and the agent
+  will say so rather than guess — see "application onboarding example.txt"
+  for the full breakdown.
+- All data comes from free, no-API-key sources: Yahoo Finance, CoinGecko,
+  frankfurter.app (ECB rates), gold-api.com, and mfapi.in (AMFI NAV data).
+- A single conversation can now move between all of these specialists
+  without getting stuck on one — ask about a fund, then crypto, then a
+  stock, all in the same chat.

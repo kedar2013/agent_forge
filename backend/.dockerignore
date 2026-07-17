@@ -1,0 +1,18 @@
+# Never bake real secrets into an image layer — even if a later layer
+# deletes the file, it's still recoverable from the image history.
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime output — mounted as Volumes in docker-compose.yml/Railway, not
+# baked into the image.
+generated_files/
+generated_images/
+
+.git/

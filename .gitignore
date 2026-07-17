@@ -1,0 +1,31 @@
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+
+# Claude Code local settings (contains local machine paths / a plaintext DB
+# password baked into a permission rule)
+.claude/settings.local.json
+
+# --- Python ---
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# --- Node / frontend ---
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# --- IDE ---
+.idea/
+
+# --- Logs ---
+*.log
+
+# --- Generated test artifacts (PDFs/PPTX/PNGs produced by local test runs) ---
+backend/generated_files/
+backend/generated_images/

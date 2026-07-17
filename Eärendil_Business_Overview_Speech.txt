@@ -1,0 +1,245 @@
+EÄRENDIL — BUSINESS OVERVIEW SPEECH
+For presenting to a non-technical business audience
+(Read time: ~10-12 minutes at a comfortable pace)
+==============================================================================
+
+[OPENING]
+
+Good [morning/afternoon], everyone. I want to walk you through something
+we've built called Eärendil — think of it as our in-house factory for
+building AI assistants, without needing an engineer to write code every
+time we want a new one.
+
+Let me start with the problem it solves, because that's really the point.
+
+------------------------------------------------------------------------------
+THE PROBLEM
+------------------------------------------------------------------------------
+
+Every team wants an AI assistant these days — sales wants one that can pull
+account data, risk wants one that can answer credit questions, finance wants
+one that can pull up market data on demand. The old way of doing this means:
+a developer writes custom code for every single assistant, wires it to the
+right data source by hand, and if you want to change so much as a sentence
+of how it behaves, you're back in a code review queue.
+
+That doesn't scale. We didn't want ten AI assistants built ten different
+ways by ten different people. We wanted one platform, one set of guardrails,
+and a way for the people who understand the business — not just the people
+who can code — to build and adjust these assistants themselves.
+
+That's what Eärendil is.
+
+------------------------------------------------------------------------------
+WHAT EÄRENDIL IS, IN ONE BREATH
+------------------------------------------------------------------------------
+
+Eärendil is a web-based control panel where you compose an AI agent out of
+building blocks — like assembling furniture from parts, rather than carving
+it from a tree. You pick what data it's allowed to touch, what actions it's
+allowed to take, what personality and instructions it follows, test it in a
+live chat window, and when you're happy with it, you publish it — and it's
+live, instantly, for real users to talk to.
+
+No code required to do any of that. The code only comes in once, behind the
+scenes, when we're teaching the platform a genuinely new capability — like
+"read a PDF" or "query a new database." After that, it's a reusable Lego
+brick anyone on the platform can pick up and attach to any agent, forever.
+
+------------------------------------------------------------------------------
+HOW IT ACTUALLY WORKS — THE WORKFLOW
+------------------------------------------------------------------------------
+
+Let me walk you through the journey, from an idea to a live assistant your
+team is actually using.
+
+STEP 1 — Build.
+You go to the "Agents" screen and create a new agent. You give it a name,
+a job description in plain English ("You are a company research
+specialist..."), and you pick which tools it's allowed to use — think of
+tools as its hands: "look up a stock price," "query the sales database,"
+"generate a chart," "export a PDF." You just attach the ones it needs.
+
+STEP 2 — Test.
+Before anything goes live, you test the agent in a Playground — a live chat
+window where you talk to your draft agent exactly like a real user would.
+You see not just its answer, but a full trace of what it actually did behind
+the scenes: which tools it called, what data came back. This matters,
+because it means nothing goes live on a hunch — you watch it work first.
+
+STEP 3 — Publish.
+One click. The agent goes live with a version number, so we always know
+exactly what was live at any point in time, and we can roll conversations
+back to compare.
+
+STEP 4 — Use.
+Published agents show up in our chat interface, where end users — our
+employees or, eventually, customers — just talk to it in plain English.
+Behind the curtain, one "orchestrator" agent acts like a smart receptionist,
+listening to the question and quietly routing it to whichever specialist
+agent actually knows the answer — a stock question goes to the market
+specialist, a crypto question to the crypto specialist — all inside the
+same conversation, without the user ever needing to know or care which
+specialist answered.
+
+That's the full loop: build, test, publish, use. No code, no deployment
+ticket, no waiting on an engineering sprint.
+
+------------------------------------------------------------------------------
+WHAT MAKES THIS SAFE TO HAND TO NON-ENGINEERS
+------------------------------------------------------------------------------
+
+Naturally, the first question from anyone in a room like this is: "if
+anyone can build and publish an AI agent, how do we stop it from going
+wrong?" Fair question. Here's what's built in:
+
+- ROLES AND APPROVALS. Not everyone has the same keys. We have admins,
+  developers, chat users, and viewers. A developer can build and test
+  freely, but anything they want to publish goes into an approval queue
+  first — an admin has to sign off before it goes live. Nothing skips that
+  gate.
+
+- A FULL AUDIT TRAIL. Every single configuration change — who changed what,
+  when — is logged in a tamper-evident chain, the same principle banks use
+  for transaction ledgers. If a question ever comes up about why an agent
+  behaves a certain way, we can answer it with certainty, not guesswork.
+
+- ROW-LEVEL DATA SECURITY, BUILT IN, NOT BOLTED ON. This is the one I'd
+  underline for a business audience: when an agent answers by writing its
+  own database query, we don't just trust it to behave. Every query is
+  intercepted and a permission rule is mechanically stapled onto it before
+  it ever touches the database — based on who's actually asking. So if a
+  regional manager asks a credit-risk question, they only ever see their
+  own region's data, even if the AI itself "wanted" to show more. The AI
+  cannot see what the person asking isn't allowed to see. That's not a
+  policy we hope the AI follows — it's enforced at the database level,
+  every single time.
+
+- A DEBUG CONSOLE. For anything that seems off, we have a trace viewer that
+  shows exactly what a conversation did step by step — which specialist
+  answered, which tools it called, what data came back, how long it took.
+  Nothing is a black box.
+
+------------------------------------------------------------------------------
+WHAT'S ALREADY BUILT AND RUNNING TODAY
+------------------------------------------------------------------------------
+
+This isn't a concept — we have working examples live right now, across
+genuinely different business domains, which is really the proof that the
+platform generalizes rather than being a one-off:
+
+1. MARKET INTELLIGENCE — a team of specialists covering stocks, crypto,
+   currency exchange, precious metals, and Indian mutual funds, all pulling
+   real, live data. Ask it "I want to invest 15,000 rupees a month for five
+   years in a small-cap fund — what could that grow into?" and it runs a
+   real compound-interest projection off real historical fund performance,
+   clearly labeled as a projection, not a promise. It also knows its own
+   limits — ask it to compare something it has no reliable data for, and it
+   says so plainly instead of making something up.
+
+2. CREDIT FACILITY ANALYSIS — a banking/credit-risk assistant where the
+   row-level security I mentioned earlier is doing real work: different
+   personas — global credit teams, regional teams, individual account
+   teams — see different slices of the same underlying data, automatically,
+   based on who's logged in. This was built without writing a line of
+   custom backend code — entirely through the same generic building blocks
+   every other agent uses.
+
+3. REVENUE AND RETURNS ANALYSIS — a second, independent proof that this
+   "compose, don't code" approach holds up: a product-performance assistant
+   answering questions like "what's the return rate for Wireless Earbuds
+   Pro over the last three months?" by writing its own database query on
+   the fly, built the same way, in a fraction of the time a custom build
+   would take.
+
+4. REPORTING, ACROSS ALL OF THEM — any of these specialists can turn its
+   own analysis into a slide deck, a PDF, or an Excel file, on request, and
+   hand back a download link right in the chat. One "export" capability,
+   built once, reused by every specialist that has something worth saving.
+
+------------------------------------------------------------------------------
+THE SELF-SERVICE ONBOARDING WIZARD
+------------------------------------------------------------------------------
+
+Here's the part I think matters most for where we're headed: we built a
+guided wizard that lets someone stand up a brand-new data-driven assistant
+from scratch — point it at a database table, and the wizard inspects the
+data, figures out sensible field labels, previews real examples, and builds
+the assistant for you. It won't let you publish something that hasn't
+proven it can actually pull real data first — it forces a live test before
+the "Publish" button even unlocks. Our sales-analytics assistant was built
+entirely this way, as the proof case.
+
+The upshot: bringing a brand-new business domain onto this platform is now
+a guided afternoon of clicking through a wizard, not a multi-week
+engineering project.
+
+------------------------------------------------------------------------------
+WHY THIS SAVES REAL MONEY
+------------------------------------------------------------------------------
+
+One more thing worth knowing about, because it goes straight to cost: every
+call these agents make to an AI model costs money and takes time. We built
+a layer underneath all of this — we call it SCIL — that automatically:
+
+- Recognizes when a question is the same or very similar to one we've
+  already answered and validated, and returns the cached answer instantly,
+  with zero new AI cost.
+- Automatically catches and self-corrects mistakes (like a malformed
+  database query) before they ever reach the user, learning from past
+  mistakes so the same error doesn't repeat.
+- Tracks all of this on a live dashboard — how many AI calls we've avoided,
+  our cache hit rate, money saved over time.
+
+This is switched on selectively, per assistant, and it's already measurably
+cutting both cost and response time on the assistants where it's enabled.
+
+------------------------------------------------------------------------------
+CLOSING — WHY THIS MATTERS TO THIS ROOM
+------------------------------------------------------------------------------
+
+So, to bring it home: Eärendil means that when a business team has an idea
+for an AI assistant, the path from idea to a safe, tested, live tool is
+measured in days, not quarters — and it's a path business owners can walk
+themselves, with engineering only needed the first time we teach the
+platform a genuinely new skill.
+
+We've already proven it works across three very different domains — market
+data, credit risk, and product returns — with the same guardrails, the same
+audit trail, and the same permission model underneath every single one of
+them.
+
+The question in front of this room isn't "can we build this for your team"
+— we already know we can, and quickly. The real question is: what's the
+first assistant you want us to build for you?
+
+I'll pause there and take questions.
+
+==============================================================================
+APPENDIX — QUICK-REFERENCE FEATURE LIST (for handout / follow-up email)
+==============================================================================
+
+- No-code agent builder: compose an AI assistant from reusable building
+  blocks — no engineering ticket required.
+- Live testing sandbox (Playground): watch an agent work before it ever
+  reaches a real user.
+- One-click publish with version history: every change is tracked, nothing
+  goes live untested.
+- Role-based permissions + publish-approval queue: developers build freely,
+  admins sign off before anything goes live.
+- Tamper-evident audit log: a full, provable record of every configuration
+  change.
+- Row-level data security: each user automatically sees only the data
+  they're authorized to see — enforced on every query, not just promised.
+- Debug console: a step-by-step trace of every conversation, for full
+  transparency into what the AI actually did.
+- Self-service domain onboarding wizard: point at a database table, get a
+  working, tested assistant the same day.
+- Built-in reporting: any assistant can generate a PDF, Excel file, or
+  slide deck of its own analysis on request.
+- Cost-saving intelligence layer (SCIL): caches validated answers,
+  self-corrects mistakes automatically, and reports savings on a live
+  dashboard.
+- Proven across multiple live domains: market intelligence, credit risk
+  analysis, product revenue/returns, and an educational assistant
+  (StudyBuddy).

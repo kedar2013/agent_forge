@@ -1,0 +1,118 @@
+EÄRENDIL — ONBOARDING WALKTHROUGH: TOOL + AGENT VIA THE UI
+Worked example: giving an agent the power to export its own analysis as a
+PDF or Excel file — one of the most broadly useful skills in the platform,
+since it turns any specialist's answer into something a user can save,
+print, or hand to someone else.
+==============================================================================
+
+THE AGENT/TOOL PAIR IN THIS EXAMPLE
+------------------------------------------------------------------------------
+Tool:  export_to_pdf        — turns a written analysis (the same markdown
+                               an agent already replies with) into a
+                               formatted PDF, returns a download link.
+Tool:  export_to_excel       — turns tabular data (e.g. a comparison table)
+                               into a formatted spreadsheet, returns a link.
+Agent: any specialist that already produces analysis worth saving — this
+       walkthrough uses stock_market_analyst, but the exact same steps
+       apply to crypto_analyst, forex_metals_analyst, or fund_analyst_agent.
+
+Why this pairing is a good example of the platform's design: the tool does
+one narrow thing well (render + serve a file) and is completely reusable —
+once it exists in your Tools library, ANY agent can pick it up. You are not
+writing PDF-generation code per agent; you compose it in once, and every
+specialist that has something worth exporting can use it.
+
+==============================================================================
+PART 1 — ONBOARDING THE TOOL
+==============================================================================
+Tools that need custom Python logic (like rendering a PDF) are the one
+piece of this platform that isn't pure no-code — someone writes the
+implementation once as an MCP server function, then it's reusable forever
+via the UI from that point on. This one is already built for you:
+backend/mcp_servers/document_export_server.py, exposing export_to_pdf and
+export_to_excel. If you were adding a brand new custom capability instead,
+this is the step you'd do in a code editor before returning to the UI.
+
+Register it as a Tool (Tools page -> "New Tool"):
+  1. Go to Tools (left sidebar) -> "New Tool"
+  2. Name:         export_to_pdf
+  3. Description:  Generate a formatted PDF from a written analysis and get
+                    a download link.
+  4. Tool type:    mcp_tool
+  5. Config (the MCP connection details):
+       Transport:   stdio
+       Command:     path to your python.exe (the same interpreter running
+                    the backend)
+       Args:        path to mcp_servers/document_export_server.py
+       Tool name:   export_to_pdf   (must match the @mcp.tool() function
+                    name exactly — this is how Eärendil finds the right
+                    function on that server)
+  6. Input schema (what the LLM must provide when it calls this tool):
+       {
+         "type": "object",
+         "properties": {
+           "title": {"type": "string"},
+           "markdown_content": {"type": "string"}
+         },
+         "required": ["title", "markdown_content"]
+       }
+  7. Click "Create tool"
+  Repeat the same steps for export_to_excel, with its own input schema
+  (title, sheet_name, rows — rows being an array of objects).
+
+==============================================================================
+PART 2 — ONBOARDING (OR EXTENDING) THE AGENT
+==============================================================================
+1. Go to Agents -> open the specialist you want to give this skill to
+   (e.g. "stock_market_analyst"). You can also do this for a brand-new
+   agent via Agents -> "New Agent" the same way.
+2. In the "Tools" panel, click "+ attach tool", pick export_to_pdf, repeat
+   for export_to_excel.
+3. Open the "Base instruction" field and add a line telling the agent when
+   and how to use them, e.g.:
+
+     If the user asks you to export, save, download, or get a PDF/report/
+     spreadsheet of your analysis, generate it yourself: call export_to_pdf
+     for a written analysis (pass the same markdown you'd normally reply
+     with), or export_to_excel for tabular data (rows as a list of
+     column-name -> value dicts). Then share the returned download link in
+     your reply.
+
+4. Click "Save changes".
+5. Click "Test in playground" (required before you can publish) — try:
+     "Tell me about Apple's stock performance, then export it as a PDF"
+   Confirm it calls the real tools and the response includes a working
+   download link.
+6. Back on the agent page, "Publish" is now enabled — click it.
+7. If this agent is already wired into market_intelligence (or whichever
+   orchestrator is live), the parent's cache invalidates automatically on
+   publish — no extra step needed to make it reachable from /chat.
+
+==============================================================================
+PART 3 — TRY IT FOR REAL
+==============================================================================
+Open /chat and ask something like:
+  "Give me a thorough analysis of Reliance Industries and export it as a PDF"
+  "Compare Bitcoin and Ethereum's 1-year returns, then give me that as an
+   Excel file"
+  "Analyze Nippon India Small Cap Fund's trend and save it as a report"
+
+The agent answers normally, then (if you asked for export, or asks itself
+whether you want it) calls the export tool with the analysis it just
+produced, and gives you back a clickable download link — a PDF with proper
+headings/bold/tables, or a formatted spreadsheet with a styled header row.
+
+==============================================================================
+NOTES
+------------------------------------------------------------------------------
+- Files are served from backend/generated_files/ via a static mount at
+  /generated-files — same pattern as the existing image-generation tool
+  (generated_images/). They accumulate over time; nothing currently prunes
+  old exports (worth adding a cleanup job if this sees real usage).
+- The PDF converter handles the same markdown subset these agents already
+  write (# ## ### headings, **bold**, *italic*, `code`, - bullets, GFM
+  tables) — it is not a full CommonMark implementation, but it covers
+  everything this app's agents actually produce.
+- This tool is reusable across every specialist by design — attach it to
+  any agent whose answers are worth saving, not just the ones in this
+  example.

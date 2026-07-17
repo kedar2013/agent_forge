@@ -1,0 +1,139 @@
+# Local dev parity, NOT the production deployment manifest — the actual
+# hosting plan targets Railway's own managed Postgres/MySQL plugins and two
+# Dockerfile-based services (backend/Dockerfile, frontend/Dockerfile)
+# configured directly in Railway's dashboard, not this file. This compose
+# file exists so a fresh checkout can `docker compose up` end-to-end
+# locally (including smoke-testing those two Dockerfiles) without installing
+# Postgres/MySQL by hand.
+#
+#   docker compose up -d postgres mysql        # just the databases
+#   docker compose up --build backend frontend # + the two app services
+#   docker compose up -d jaeger                # + tracing (see below)
+#
+# Then set OTEL_ENABLED=true in backend/.env and restart the backend — every
+# agent run (playground, /invoke, /chat) starts exporting spans here.
+#   - Jaeger UI + Query API: http://localhost:16686
+#   - OTLP gRPC receiver:    localhost:4317   (what OTEL_EXPORTER_OTLP_ENDPOINT points at)
+#
+# Swap this service for any other OTLP-compatible backend (Grafana Tempo,
+# Langfuse, Honeycomb, Datadog agent, a managed OTel Collector, ...) without
+# touching backend code — only OTEL_EXPORTER_OTLP_ENDPOINT (and, for the
+# in-app "Debug Console" trace viewer specifically, JAEGER_QUERY_URL) change.
+services:
+  # pgvector/pgvector, not stock postgres — this app requires
+  # `CREATE EXTENSION vector` (SCIL semantic cache/entity memory embeddings,
+  # retrieval_tool). A managed Postgres in production needs the same
+  # extension allow-listed or an equivalent image.
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: agent-forge-postgres
+    environment:
+      - POSTGRES_USER=agent_forge
+      - POSTGRES_PASSWORD=agent_forge
+      - POSTGRES_DB=agent_forge
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_forge"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # Backs every *_MYSQL_*/SALES_DB_* connection prefix in backend/.env.example
+  # — by convention (not enforced in code) all of those point at the same
+  # physical server, just different database names/table prefixes.
+  mysql:
+    image: mysql:8
+    container_name: agent-forge-mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=agent_forge
+      - MYSQL_DATABASE=agentic_ai
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    container_name: agent-forge-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://agent_forge:agent_forge@postgres:5432/agent_forge
+      - MYSQL_HOST=mysql
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=agent_forge
+      - MYSQL_DATABASE=agentic_ai
+      # GEMINI_API_KEY / ANTHROPIC_API_KEY / AGENT_FORGE_API_TOKEN /
+      # USER_TOKEN_SECRET are intentionally NOT set here — pass them via a
+      # local .env file (docker compose --env-file, or `env_file:` below)
+      # rather than hardcoding real secrets into this checked-in file.
+      - CORS_ORIGINS=["http://localhost:8080"]
+      - BACKEND_PUBLIC_URL=http://localhost:8000
+    env_file:
+      - ./backend/.env
+    ports:
+      - "8000:8000"
+    volumes:
+      - generated_files:/app/generated_files
+      - generated_images:/app/generated_images
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: http://localhost:8000/api
+    container_name: agent-forge-frontend
+    depends_on:
+      - backend
+    ports:
+      # 8080, not 80 or 5173 — avoids colliding with `npm run dev`'s own
+      # 5173 if that's running alongside this compose stack.
+      - "8080:80"
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    container_name: agent-forge-jaeger
+    ports:
+      - "16686:16686" # UI + Query API (debug console reads this)
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver (unused here, exposed for convenience)
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    restart: unless-stopped
+
+  # Optional local MongoDB for the generic `mongo_query_tool` tool type
+  # (backend/app/tool_registry/mongo_tool.py) — not required by Credit
+  # Facility Analysis (that domain now runs on MySQL, see backend/.env's
+  # CREDIT_FACILITY_MYSQL_* vars), but available for any future Mongo-backed
+  # domain built on the same generic tool_registry + access_policies
+  # framework. No auth by default.
+  mongo:
+    image: mongo:7
+    container_name: agent-forge-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  mysql_data:
+  generated_files:
+  generated_images:
+  mongo_data:

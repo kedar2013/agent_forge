@@ -1,0 +1,136 @@
+Eärendil — ONBOARDING A NEW AGENT VIA THE UI
+Worked example: "Company Research Copilot"
+==============================================================================
+
+WHAT YOU ASKED FOR vs. WHAT'S REALLY AVAILABLE FOR FREE
+------------------------------------------------------------------------------
+You listed 15 research dimensions. Before building, I checked what's
+actually fetchable from free, no-API-key sources (Yahoo Finance's public
+endpoints) so this agent reports real data, not guesses. Here's the honest
+breakdown:
+
+  REAL DATA AVAILABLE (tools already built and in your Tools library):
+  - Company overview            -> get_company_profile
+  - Product portfolio           -> get_company_profile (business summary)
+  - Revenue trends              -> get_revenue_trend (last 4 quarters, real)
+  - Quarterly performance       -> get_quarterly_earnings (EPS actual vs. estimate)
+  - Analyst sentiment           -> get_analyst_sentiment (buy/hold/sell + rating changes)
+  - Stock performance           -> analyze_stock_performance (trailing returns)
+  - Recent news                 -> get_company_news (real headlines)
+  - Regulatory filings          -> get_regulatory_filings (real SEC filings + links)
+  - Fundamentals (bonus)        -> get_company_fundamentals (market cap, P/E, EPS, beta)
+
+  PARTIAL / BEST-EFFORT (no dedicated data source, covered loosely):
+  - Geographic presence   -> only HQ country from get_company_profile; no
+                              revenue-by-region breakdown exists for free
+  - Recent acquisitions   -> shows up in get_company_news headlines and
+                              occasionally in get_regulatory_filings, but
+                              isn't a guaranteed, structured feed
+  - Management changes    -> same as above (news headlines + the "Corporate
+                              Changes" 6-K filings that do show up in
+                              get_regulatory_filings for foreign issuers)
+  - Risks                 -> get_regulatory_filings gives you a real link to
+                              the actual 10-K/20-F, but nothing parses the
+                              "Risk Factors" section out of it — you'd read
+                              the filing yourself
+
+  NOT AVAILABLE FOR FREE (genuinely don't build this — no honest data source):
+  - Competitors    -> no free structured "competitors" endpoint exists
+  - ESG initiatives -> tested Yahoo's esgScores endpoint directly; empty for
+                       every symbol tried, likely discontinued
+  - Credit ratings  -> Moody's/S&P/Fitch ratings are paid data, no free API
+
+  I did NOT build agent behavior for the three "not available" items — an
+  agent that "answers" those would just be hallucinating. If you get a paid
+  API key for any of them later, tell me and I'll wire it in properly.
+
+Everything above is already registered in your Tools library — you don't
+need to create any of it. This guide only walks through composing the AGENT
+out of tools that already exist, exactly like you'd do for any new agent.
+
+==============================================================================
+STEP-BY-STEP: BUILDING "Company Research Copilot"
+==============================================================================
+
+1. CREATE THE AGENT
+   - Go to Agents (left sidebar) -> "New Agent"
+   - Name:        company_research_copilot
+   - Description: Comprehensive company research — overview, financials,
+                   analyst sentiment, news, and filings in one place.
+   - Base instruction: paste this (edit tone/scope as you like) —
+
+       You are a company research specialist. When asked about a company
+       (e.g. "tell me about Infosys"), resolve its ticker with search_stocks
+       first if you don't already have one, then pull together whichever of
+       the following the user asked about — call each tool you need, don't
+       guess:
+
+       - get_company_profile — overview, sector/industry, HQ, what they do
+       - get_company_fundamentals — market cap, P/E, EPS, dividend yield, beta
+       - get_revenue_trend — quarterly revenue and QoQ growth
+       - get_quarterly_earnings — EPS actual vs. estimate, upcoming estimate
+       - get_analyst_sentiment — buy/hold/sell counts, recent rating changes
+       - analyze_stock_performance — trailing returns, 52-week range
+       - get_company_news — recent headlines
+       - get_regulatory_filings — recent SEC filings with links
+
+       If asked about competitors, ESG scores, or credit ratings, say plainly
+       that you don't have a reliable data source for that rather than
+       guessing. Never mention internal tool or agent names in your reply —
+       just answer in plain language. Format your answer in markdown: use
+       headings for each section you cover, and a table for any list of
+       numbers (quarterly revenue, EPS history, etc).
+
+       You provide data and analysis, not investment advice. Never tell the
+       user to buy/sell/hold, and if asked for a recommendation, clarify you
+       can only surface data and trends, not personalized financial advice.
+
+   - Leave Model as gemini-2.5-flash, Temperature 0.2–0.3
+   - Click "Create agent" — this takes you to the agent's own page.
+
+2. ATTACH THE TOOLS
+   On the agent's page, find the "Tools" panel and click "+ attach tool".
+   Attach each of these one at a time (click, panel closes, click "+ attach
+   tool" again for the next one):
+     - search_stocks
+     - get_company_profile
+     - get_company_fundamentals
+     - get_revenue_trend
+     - get_quarterly_earnings
+     - get_analyst_sentiment
+     - analyze_stock_performance
+     - get_company_news
+     - get_regulatory_filings
+
+3. TEST IN PLAYGROUND (required before you can publish)
+   - Click "Test in playground" (top right of the agent page)
+   - Try: "Tell me about Infosys" or "Give me a research summary on Apple"
+   - Confirm it calls real tools and gives a sensible, well-formatted answer
+   - Go back to the agent page — "Publish" is now enabled (it stays disabled
+     until a playground run succeeds against this exact configuration)
+
+4. PUBLISH THE AGENT
+   - Click "Publish" — this creates version 1
+
+5. WIRE IT INTO THE LIVE CHATBOT (market_intelligence)
+   The agent above works standalone, but /chat only talks to the
+   "market_intelligence" orchestrator — so to make it reachable from actual
+   chat conversations:
+   - Go to Agents -> open "market_intelligence"
+   - In the "Sub-agents" panel, click "+ attach sub-agent" and pick
+     "company_research_copilot" (only published agents show up here — which
+     is why step 4 had to happen first)
+   - Open market_intelligence's "Base instruction" field and add a line
+     mentioning the new specialist, e.g.:
+       "- company_research_copilot: broad company research — overview,
+       financials, analyst sentiment, news, filings (e.g. 'tell me about
+       Infosys')."
+   - Click "Save changes", then "Test in playground" once more (the gate
+     re-applies whenever the config changes), then "Publish" again — this
+     bumps market_intelligence to a new version AND correctly invalidates
+     any cached copy of it so /chat picks up the change immediately.
+
+6. TRY IT FOR REAL
+   Open /chat and ask: "Tell me about Infosys" — it should transfer to
+   company_research_copilot and pull together several of the tools above
+   into one answer.

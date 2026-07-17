@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Eärendil — compose, test, and publish AI agents without touching code." />
+    <meta name="author" content="Kedar's Eärendil Studio" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <title>Eärendil · Agent Platform</title>
+    <script>
+      (function () {
+        // Kept in sync with lib/theme.tsx's Theme/DARK_FAMILY — this only
+        // runs before React mounts, to avoid a flash of the wrong theme.
+        var validThemes = ['light', 'dark', 'midnight', 'sunset', 'forest', 'rose']
+        var darkFamily = ['dark', 'midnight', 'forest']
+        var stored = localStorage.getItem('Eärendil-theme')
+        var systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches
+        var resolved = validThemes.indexOf(stored) !== -1 ? stored : (systemDark ? 'dark' : 'light')
+        document.documentElement.dataset.theme = resolved
+        document.documentElement.classList.toggle('dark', darkFamily.indexOf(resolved) !== -1)
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

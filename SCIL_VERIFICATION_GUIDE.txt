@@ -1,0 +1,315 @@
+EÄRENDIL — SCIL FRAMEWORK VERIFICATION GUIDE
+How to actually prove every SCIL capability is working, with copy-pasteable
+commands against this real deployment (not a hypothetical setup).
+==============================================================================
+
+READ THIS FIRST — THE #1 GOTCHA
+------------------------------------------------------------------------------
+The browser /chat UI calls POST /chat/message/stream exclusively. The
+streaming path runs every validator to decide whether an answer is safe to
+CACHE, but it NEVER retries and NEVER writes to scil_correction_memory —
+that only happens on the non-streaming path (_run_turn, not _stream_turn).
+
+If you test self-correction, entity-typo recovery, or exemplar injection by
+typing into the browser chat window, you will conclude SCIL "isn't
+correcting anything" — not because it's broken, but because the browser UI
+structurally cannot exercise that code path. To see the real retry loop,
+call POST /api/chat/message (no /stream) directly with curl, as shown
+throughout this guide. Playground (/agents/.../playground) also can't be
+used for RLS-scoped agents (credit_facility_analyst) since it can't
+impersonate a persona — same reason: use curl + a real login.
+
+==============================================================================
+PREREQUISITES — GET YOUR TOKENS ONCE
+==============================================================================
+
+# Static admin token (from backend/.env) — for all /api/scil/* admin
+# endpoints (metrics, cache, corrections, entities, eval framework):
+ADMIN="<AGENT_FORGE_API_TOKEN from backend/.env>"
+
+# A real demo credit_facility persona login — needed for anything that
+# exercises RLS (credit_facility_analyst's cache scoping, entity
+# resolution, self-correction). All 8 demo logins use password
+# Demo@12345 (see backend/app/domains/credit_facility/seed_data.py):
+TOKEN=$(curl -s -X POST http://127.0.0.1:8000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"gcm1@creditfacility.demo","password":"Demo@12345"}' \
+  | python -c "import sys,json; print(json.load(sys.stdin)['token'])")
+
+Agent UUIDs used below (query yours if these have changed):
+  credit_facility_analyst   b660bdcb-c86f-4347-a9a1-327fc421dbd1
+  revenue_returns_analyst   58b74a71-eab8-48c3-95fa-89eed711114a
+  stock_market_analyst      9d416c89-d4a1-4d86-bc72-f9fe4dc43705
+
+==============================================================================
+1. SEMANTIC RESPONSE CACHE (exact-hash + pgvector cosine similarity)
+==============================================================================
+WHAT IT DOES: a repeat or near-duplicate question returns the cached
+validated answer with ZERO new LLM calls.
+
+VERIFY — exact repeat:
+  1. Ask a stock_market_analyst question twice, verbatim, via /chat/message
+     or /playground/run.
+  2. Check scil_metrics for the second call:
+       SELECT route, llm_calls, latency_ms FROM agent_forge.scil_metrics
+       WHERE agent_id = '9d416c89-...' ORDER BY created_at DESC LIMIT 2;
+  SUCCESS LOOKS LIKE: first row route='llm', second row route='cache_hit',
+  llm_calls=0, latency_ms in the tens of ms (not seconds).
+
+VERIFY — near-duplicate (paraphrase, proves cosine similarity works, not
+just exact-hash):
+  Ask "What's Apple's stock price?" then "What is Apple's current share
+  price?" — different wording, same intent. Second call should still be
+  route='cache_hit' if cosine similarity clears the agent's
+  cache_similarity_threshold (default 0.80).
+
+VERIFY via dashboard: /scil Overview tab -> "Cache hit rate" stat tile and
+the "Semantic cache" table (shows input_text, hit_count, last_hit_at per
+entry — hit_count should increment on your repeat).
+
+==============================================================================
+2. TEMPLATE-BASED DETERMINISTIC ROUTING (route="deterministic")
+==============================================================================
+WHAT IT DOES: a configured regex/slot template answers with ZERO LLM calls,
+cheaper than even the cache (pure regex, no DB round trip for the match
+itself).
+
+VERIFY: needs an agent with model_config.scil.templates_enabled=true and at
+least one template — none of the 5 production agents have one configured by
+default (this is opt-in per agent). To see it fire:
+  1. Set a template on a test agent, e.g.
+     {"pattern": "^ping$", "response_text": "pong"}
+  2. Ask exactly "ping" (case/whitespace-normalized by the normalizer, but
+     the match itself is fullmatch — "ping please" will NOT match).
+  3. Check scil_metrics: route='deterministic', llm_calls=0.
+  IMPORTANT: fullmatch only — this is deliberate (see safety rule #4 in
+  SCIL_technical_document.md section 7): a template can never hijack a
+  longer, more nuanced question that merely contains the phrase.
+
+==============================================================================
+3. DETERMINISTIC VALIDATORS (sql / json_schema / hallucination zero-tool-call)
+==============================================================================
+WHAT IT DOES: checks a turn's output deterministically, no LLM call, before
+deciding whether to cache it (and whether to retry it — see section 6).
+
+VERIFY "hallucination" (Hallucination:NoToolCall) — credit_facility_analyst
+already has this validator enabled:
+  curl -s -X POST http://127.0.0.1:8000/api/chat/message \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"message":"What is the capital of France?","agent_name":"credit_facility_analyst"}'
+  Then: SELECT route, retries FROM agent_forge.scil_metrics
+        WHERE agent_id = 'b660bdcb-...' ORDER BY created_at DESC LIMIT 1;
+  SUCCESS LOOKS LIKE: the agent has tools attached but answers an off-
+  domain question without calling any of them -> validator fires ->
+  route='llm_retry' if it then retries (it will keep failing the same way
+  since there's nothing to fix — a legitimately correct refusal still
+  trips this shape-based check; see gotcha in section 6).
+
+VERIFY "sql" — DO NOT test this on any of the 5 production agents; none of
+them answer in raw SQL (their final reply is prose synthesized from tool
+results). Attaching "sql" to a prose-answering agent will make it fail
+100% of the time (this exact bug was found and fixed on
+credit_facility_analyst earlier — see enable_scil.py's comment block for
+the full postmortem). Only relevant if you build a new agent whose literal
+final answer IS a bare SQL string.
+
+==============================================================================
+4. LLM-JUDGE GROUNDEDNESS CHECK (Hallucination:Ungrounded, opt-in)
+==============================================================================
+WHAT IT DOES: a second model call reviews the tool outputs a turn actually
+received and flags any claim in the final answer not traceable to them.
+Only runs if hallucination_groundedness_check: true is set (extra cost per
+turn) AND at least one tool was called (the free zero-tool-call check
+already covers the no-tool case).
+
+VERIFY: none of the 5 production agents have hallucination_groundedness_
+check enabled today (it's the blocking/retrying tier, deliberately left
+off — see section 12 below for the non-blocking alternative this session
+added). To see it fire, set it true on a test agent's scil config, then
+ask a question its tool answers accurately but coach the model (via a
+throwaway custom instruction) to add one invented detail — the judge
+should catch it and trigger a retry with error_signature=
+'Hallucination:Ungrounded'.
+
+==============================================================================
+5. ENTITY RESOLUTION (typo self-correction, Entity:NoMatch)
+==============================================================================
+WHAT IT DOES: a data_query_tool call that ran clean SQL and got zero rows,
+where the searched literal is a near-miss of something already remembered
+in scil_entity_memory, gets auto-retried with the corrected name instead
+of dead-ending in "no matches found."
+
+VERIFY — two-step, must use the non-streaming endpoint:
+  1. First, get "Tesla Inc" successfully resolved once (seeds
+     scil_entity_memory):
+     curl -s -X POST http://127.0.0.1:8000/api/chat/message \
+       -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+       -d '{"message":"What is Tesla Inc'"'"'s credit facility utilization?","agent_name":"credit_facility_analyst"}'
+  2. Then ask the SAME thing with a typo:
+     curl -s -X POST http://127.0.0.1:8000/api/chat/message \
+       -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+       -d '{"message":"What is Tessla Inc'"'"'s credit facility utilization?","agent_name":"credit_facility_analyst"}'
+  3. Check: SELECT route, retries FROM agent_forge.scil_metrics
+       WHERE agent_id='b660bdcb-...' ORDER BY created_at DESC LIMIT 1;
+     SELECT error_signature, corrected_output FROM
+       agent_forge.scil_correction_memory
+       WHERE agent_id='b660bdcb-...' ORDER BY created_at DESC LIMIT 1;
+  SUCCESS LOOKS LIKE: route='llm_retry', error_signature='Entity:NoMatch',
+  and the second call's actual answer contains real Tesla Inc data instead
+  of "no companies matched 'Tessla'."
+  GOTCHA: cold start (step 2 run BEFORE step 1 ever succeeded) will NOT
+  trigger a retry — there's nothing in memory yet to correct against. This
+  is deliberate (safety rule #10), not a bug.
+  ALSO CHECK via dashboard: /scil admin API GET /api/scil/entities?agent_id=...
+  lists what's actually remembered.
+
+==============================================================================
+6. SELF-CORRECTION RETRY LOOP, END TO END
+==============================================================================
+This is the mechanism sections 3-5 all feed into. To see the full loop
+(fail -> structured feedback to the SAME model -> retry -> recover -> write
+correction memory -> cache the FIXED answer) in one shot:
+
+  Use the exact worked example from SCIL_technical_document.md section 7:
+  ask credit_facility_analyst an off-domain question via /chat/message
+  (non-streaming). Confirm via scil_metrics (route='llm_retry', retries>0)
+  and scil_correction_memory (a new row with correction_source='auto_retry').
+
+WHAT "WORKING" MEANS HERE, PRECISELY:
+  - retries exhausted, still failing -> answer IS returned to the user
+    (never silently dropped) but NEVER cached (verify: no matching row in
+    scil_semantic_cache for that question afterward).
+  - retries exhausted -> an "hallucination_unresolved" event should appear
+    in that turn's invocation_log/events (visible in Debug Console
+    /debug/traces for that trace_id).
+  - recovered on retry -> the CORRECTED answer (not the failed one) is what
+    gets cached — verify scil_semantic_cache.output_payload for that
+    question matches the retry's final response, not the first attempt.
+
+==============================================================================
+7. CORRECTION-EXEMPLAR INJECTION (few-shot from past mistakes)
+==============================================================================
+WHAT IT DOES: before an agent's FIRST attempt on a new turn, its top-k most
+similar past corrections (cosine >= 0.85) get prepended to the outbound
+prompt as a compact few-shot block — known mistakes avoided up front,
+not just recovered from after the fact.
+
+VERIFY: this only changes the PROMPT sent to the model, not the transcript
+or cache key, so you can't see it in the response directly — verify via
+the Debug Console instead:
+  1. After section 5 or 6 has produced at least one scil_correction_memory
+     row for an agent, ask a SIMILAR (not identical) question again.
+  2. Open /debug/traces, find that invocation's root span.
+  3. The outbound prompt attribute should contain a block like "A previous,
+     similar request with this same error was successfully corrected to:
+     ..." prepended to your actual message.
+  ALSO: SELECT reuse_count FROM agent_forge.scil_correction_memory WHERE
+  id = <the correction's id> — reuse_count should have incremented if a
+  later turn's exemplar fetch matched it (this happens both for the
+  exemplar-injection path AND the "known correction" lookup inside an
+  active retry — check corrector.find_known_correction call sites if you
+  need to distinguish which).
+
+==============================================================================
+8. RLS-AWARE PER-USER CACHE SCOPING (cache_scope: "user")
+==============================================================================
+WHAT IT DOES: for an RLS-scoped agent (credit_facility_analyst uses
+cache_scope="user"), the cache key includes WHO asked, so one persona's
+cached answer can never be served to a different persona.
+
+VERIFY — the exact test already run and confirmed live earlier in this
+deployment:
+  1. Log in as gcm1@creditfacility.demo, ask about Tesla Inc via
+     /chat/message. Confirm it caches (route='llm' first time).
+  2. Log in as a DIFFERENT demo persona (e.g. nongsg1@creditfacility.demo —
+     see DEMO_USERS in seed_data.py for the full list of 8), ask the exact
+     same question.
+  SUCCESS LOOKS LIKE: route='llm' again (a cache MISS), not 'cache_hit' —
+  proving the second persona's identical question did NOT reuse the first
+  persona's cached answer. Compare against a control: ask the SAME
+  question twice as the SAME persona — that second call should be
+  route='cache_hit'.
+  ALSO CHECK: SELECT scope_key FROM agent_forge.scil_semantic_cache WHERE
+  agent_id='b660bdcb-...' — each row's scope_key should be a distinct
+  user_id, never empty string (empty string = global scope, which would be
+  wrong for this agent).
+
+==============================================================================
+9. METRICS + SCIL DASHBOARD (Overview tab, /scil)
+==============================================================================
+VERIFY the numbers are real, not decorative — cross-check the dashboard's
+stat tiles against a raw query for the same window:
+  SELECT route, count(*), sum(llm_calls) FROM agent_forge.scil_metrics
+  WHERE created_at >= now() - interval '30 days' GROUP BY route;
+Compare cache_hit count / total count against the dashboard's "Cache hit
+rate" tile — should match exactly (both are the same query, just one via
+the API). Click each stat tile (this session added this): "LLM calls
+avoided"/"Cache hit rate" jump to the Semantic Cache table below; "Retried
+turns"/"Retry success rate" and "Hallucination flags" jump to Correction
+Memory (the latter pre-filters to the hallucination category).
+
+VERIFY the KILL SWITCH:
+  cd backend && python scripts/enable_scil.py --disable
+  Ask any previously-cached question again -> route='disabled' in
+  scil_metrics, and behavior should be byte-for-byte pre-SCIL (no caching,
+  no retries). Re-run without --disable to restore.
+
+==============================================================================
+10. EVAL FRAMEWORK — GOLDEN-QUESTION REGRESSION SUITE (added this session)
+==============================================================================
+WHAT IT DOES: curated (question, expected_criteria) pairs per agent,
+re-run on demand against the PUBLISHED version, graded by an LLM judge —
+catches a prompt/tool/config change that silently breaks a previously-
+working answer.
+
+VERIFY:
+  curl -s "http://127.0.0.1:8000/api/scil/eval/cases?agent_id=58b74a71-..." \
+    -H "Authorization: Bearer $ADMIN"
+  curl -s -X POST "http://127.0.0.1:8000/api/scil/eval/run" \
+    -H "Authorization: Bearer $ADMIN" -H "Content-Type: application/json" \
+    -d '{"agent_id":"58b74a71-..."}'
+  SUCCESS LOOKS LIKE: a batch_id, and per-case pass/fail with judge
+  reasoning. 21 real cases already seeded across credit_facility_analyst,
+  revenue_returns_analyst, "mutual fund analyser", nl2sql_orchestrator, and
+  reporting_specialist (backend/scripts/seed_eval_cases.py) — re-run any
+  of those batches right now to see live results, or check the Evals tab
+  on /scil (SegmentedControl next to the date range) for the same via UI,
+  including a "Run now" button and an "Add golden question" form.
+  GOTCHA: RLS-scoped agents (credit_facility_analyst) grade against the
+  ADMIN principal's identity, not a persona — if that admin account has no
+  SOEID assigned, every credit-facility-touching case will show an honest
+  RLS-denial, not a real answer. This is expected until an admin account
+  is assigned a demo persona via /users.
+
+==============================================================================
+11. EVAL FRAMEWORK — LIVE-TRAFFIC GROUNDEDNESS SAMPLING (added this session)
+==============================================================================
+WHAT IT DOES: a random fraction of REAL successful turns (eval_sample_rate,
+set to 0.2 on the key agents) gets scored fire-and-forget by the same
+LLM-judge groundedness check as section 4 — but never blocks, never
+retries, purely observational.
+
+VERIFY:
+  1. Send ~10-15 real questions to stock_market_analyst (or any agent with
+     eval_sample_rate > 0) via /chat/message or /invoke — at 0.2 sample
+     rate, expect roughly 2-3 to get sampled.
+  2. curl -s "http://127.0.0.1:8000/api/scil/eval/groundedness/summary?range_days=1" \
+       -H "Authorization: Bearer $ADMIN"
+  SUCCESS LOOKS LIKE: total_samples > 0, grounded_rate close to 1.0 for a
+  well-behaved agent. Check the Evals tab's "Live-traffic groundedness
+  sampling" chart for the same data, plus a "recent flagged" table for any
+  ungrounded samples with the judge's stated reason.
+  GOTCHA: this is fire-and-forget — a sampled turn's judge call happens
+  AFTER the response is already returned to the user, so don't expect the
+  count to update instantly; give it a few seconds and re-query.
+
+==============================================================================
+QUICK REFERENCE — WHAT "WORKING" LOOKS LIKE, PER route VALUE
+==============================================================================
+  disabled      SCIL off for this agent — exact pre-SCIL behavior
+  deterministic Template matched — 0 LLM calls, ~1ms
+  cache_hit     Semantic cache hit (exact or cosine) — 0 LLM calls
+  llm           Normal LLM call, validated clean on first try (or no
+                validators configured) — this IS success, not a miss
+  llm_retry     At least one validator failed and the self-correction loop
+                fired — check `retries` column for how many times

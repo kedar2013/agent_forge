@@ -1,0 +1,374 @@
+REVENUE AND RETURNS — NEW DOMAIN ONBOARDING GUIDE
+===================================================
+Target platform: Agent Onboarding / Eärendil (backend/, FastAPI + Google ADK)
+Written: 2026-07-14
+UPDATE 2026-07-14: this domain has since actually been built following the
+steps below (Path B, scripted) and is live — `revenue_returns_analyst` is
+a published agent, tested end-to-end against real MySQL data (verified via
+both a specific-product query and a business-unit/category rollup query,
+both correctly resolving product names, writing real SQL, and returning
+real numbers). No row-level security was added (Part 2, Step 3 was
+skipped — every user sees all data). This guide is left as-written below
+since it's still the accurate step-by-step for how it was actually done;
+see `backend/app/domains/revenue_and_returns/` for the real files and
+README.md's "Revenue and Returns Analysis" section for the quick-start
+commands.
+
+
+PART 0 — IS THE NL2SQL TOOLING GENERIC ENOUGH FOR THIS? (short answer: yes)
+============================================================================
+
+This platform's current-generation data-access tool, `data_query_tool`
+(backend/app/tool_registry/data_query_tool.py), is fully metadata-driven:
+
+  - It is ONE Python class, instantiated per tool row. Nothing in it names
+    any specific table, column, or domain.
+  - Table/column knowledge comes entirely from a `data_entities` row (a
+    JSON "data dictionary": connection info, table name, column list with
+    labels/types/format hints). Change the domain, change the row — never
+    the code.
+  - The LLM writes the actual SELECT statement at chat time, guided by a
+    schema description auto-composed from the data_entities row. The tool
+    only validates STRUCTURE (via a real sqlglot AST: exactly one read-only
+    SELECT, only the allowed table, no INSERT/UPDATE/DELETE/DDL anywhere in
+    the parse tree) and mechanically ANDs a row-level-security predicate
+    onto the query before running it — regardless of what the LLM wrote.
+  - Row-level security (`access_policies` + `policy_engine.py`) is equally
+    generic: a persona is resolved from a lookup table/collection you point
+    it at, and each persona maps to a declarative JSON rule (not code).
+    Four modes: GLOBAL (no restriction), ATTRIBUTE_SCOPED (WHERE col IN
+    (values)), ID_SCOPED (WHERE id_col IN (a per-user coverage list)), and
+    EXACT (the LLM's own query must already contain a literal equality on
+    a specific column — no browsing allowed). RLS is entirely OPTIONAL per
+    tool; skip it if every user should see the same data.
+
+  Proof this is genuinely reused, not just theoretically reusable:
+  `credit_facility_analyst` (a banking/credit-risk domain) and
+  `sales_analytics_analyst` (onboarded entirely through the UI wizard) both
+  run on these exact same generic pieces with zero new Python. Separately,
+  `reporting_specialist` (chart/slide/PDF/Excel export, a different generic
+  capability) is attached as a sub-agent to BOTH `market_intelligence_orchestrator`
+  and `credit_facility_analyst` — same agent, two unrelated domains.
+
+  The ONE tool type that is NOT generic: `nl2sql_query_tool` / `db_schema_tool`
+  (backend/mcp_servers/slide_reporting_server.py) — this is a legacy,
+  domain-bound tool hard-wired to the `sales_analytics` schema with regex-
+  based (not AST-based) validation. It is kept only for `slide_reporting_agent`'s
+  existing behavior. DO NOT build a new domain on this tool type — use
+  `data_query_tool` instead, as this guide does.
+
+  Bottom line: yes, "Revenue and Returns" (or any similar tabular analytics
+  domain) can be onboarded with ZERO new tool/validation code — only
+  configuration (a data dictionary + optional access policy + tool rows +
+  an agent) and, if you want row-level security or demo data, a small,
+  boilerplate Python package that mirrors credit_facility's, purely for
+  seeding.
+
+
+PART 1 — TWO ONBOARDING PATHS
+============================================================================
+
+There are two equivalent paths. They produce identical database rows.
+
+  PATH A — UI WIZARD (recommended, zero code)
+    /onboarding/new-domain in the admin frontend. Steps: Domain -> Identity
+    & access (optional) -> Data entities -> Tools -> Agent -> Test & publish.
+    This is the officially recommended path — `sales_analytics_analyst` was
+    onboarded entirely this way. Use this unless you specifically need
+    scripted, repeatable, git-tracked seeding (e.g. demo data + demo logins
+    that need to be reset/reseeded regularly, which is why credit_facility
+    used Path B instead).
+
+  PATH B — SCRIPTED (what credit_facility used; recommended for domains
+    that ship with demo data / need --reset repeatability)
+    A small `app/domains/<domain>/` Python package that calls the exact
+    same underlying functions the wizard's HTTP forms call
+    (`_hydrate_data_query_tool` etc.), run from the command line.
+
+This guide walks Path B in full (since it's git-tracked, repeatable, and
+what an engineer would actually commit to the repo), and calls out the
+equivalent wizard screen at each step for anyone doing Path A instead.
+
+
+PART 2 — STEP BY STEP: ONBOARDING "REVENUE AND RETURNS"
+============================================================================
+
+STEP 1 — Design and create the database tables
+------------------------------------------------
+Decide your table shape BEFORE anything else — the platform introspects
+whatever tables already exist, it does not design them for you.
+
+Pattern to follow (same shape as every existing domain here): one
+"master"/hierarchy table for lookup+search, one "fact" table with the
+actual metrics, one row per (entity, period).
+
+  -> backend/app/domains/revenue_and_returns/schema.sql (already written,
+     see that file) creates:
+       rr_product_master              (dimension/hierarchy — one row per product)
+       rr_revenue_returns_monthly     (fact — one row per product per month)
+       rr_user_persona                (optional, only if you need RLS)
+       rr_user_product_coverage       (optional, only if you need RLS)
+
+  Run it against your MySQL server:
+    mysql -h <host> -u <user> -p <database> < backend/app/domains/revenue_and_returns/schema.sql
+
+  [Wizard equivalent: none — the wizard introspects existing tables, it
+  never creates them. Table creation is always a manual DBA/DDL step.]
+
+
+STEP 2 — Add a connection to backend/.env
+--------------------------------------------
+Add a new env-var prefix, following the exact pattern every other MySQL
+domain in this repo uses (see CREDIT_FACILITY_MYSQL_* in backend/.env.example):
+
+    REVENUE_RETURNS_MYSQL_HOST=127.0.0.1
+    REVENUE_RETURNS_MYSQL_PORT=3306
+    REVENUE_RETURNS_MYSQL_USER=root
+    REVENUE_RETURNS_MYSQL_PASSWORD=
+    REVENUE_RETURNS_MYSQL_DATABASE=agentic_ai
+
+Restart the backend after adding these — connection discovery
+(`GET /api/data-entities/connections`) scans env vars at process start.
+
+  [Wizard equivalent: Data entities step's connection picker reads these
+  same env vars live — this step is identical for both paths.]
+
+
+STEP 3 — (Optional) Design row-level access, if this domain needs it
+------------------------------------------------------------------------
+Skip this step entirely if every user should see all revenue/returns data.
+If different users should see different products/business units, decide:
+
+  - What identifies a user for lookup purposes: their Eärendil account id
+    (`_principal_user_id`) or their corporate SOEID (`_principal_soeid`,
+    admin-assignable on /users) — credit_facility uses SOEID.
+  - What personas exist and what each can see. Suggested starting point,
+    mirroring credit_facility's GCM/GSG/NON_GSG/CCB four-tier pattern:
+
+      GLOBAL       -> sees everything                    (_policy_mode: GLOBAL)
+      REGIONAL     -> sees only their region's products   (_policy_mode: ATTRIBUTE_SCOPED, field=region)
+      PRODUCT_OWNER-> sees only their assigned products   (_policy_mode: ID_SCOPED, field=product_id, via rr_user_product_coverage)
+      EXTERNAL     -> must supply an exact product_id, no browsing (_policy_mode: EXACT)
+
+  This is pure JSON config, not code — see backend/app/domains/credit_facility/policy_config.py
+  for the exact shape to copy. A new
+  backend/app/domains/revenue_and_returns/policy_config.py would look like:
+
+      QUERY_POLICY_NAME = "revenue_returns_query_access"
+      SEARCH_POLICY_NAME = "revenue_returns_search_access"
+
+      RESOLVER_CONFIG = {
+          "type": "mysql",
+          "connection_env_prefix": "REVENUE_RETURNS_MYSQL",
+          "identity_state_key": "_principal_soeid",   # or "_principal_user_id"
+          "persona_lookup": {
+              "source": "rr_user_persona", "match_field": "user_id", "project": "persona",
+          },
+          "scope_lookups": {
+              "coverage": {
+                  "source": "rr_user_product_coverage", "match_field": "user_id", "project": "product_id",
+              },
+          },
+          "field_names": {"attribute": "region", "id": "product_id", "exact": "product_id"},
+      }
+
+      QUERY_RULES = {
+          "GLOBAL":        {"_policy_mode": "GLOBAL"},
+          "REGIONAL":      {"_policy_mode": "ATTRIBUTE_SCOPED", "_attr_values": ["APAC", "EMEA"]},
+          "PRODUCT_OWNER": {"_policy_mode": "ID_SCOPED", "_id_values": "$coverage"},
+          "EXTERNAL":      {"_policy_mode": "EXACT"},
+      }
+      SEARCH_RULES = {
+          "GLOBAL":        {"_policy_mode": "GLOBAL"},
+          "REGIONAL":      {"_policy_mode": "ATTRIBUTE_SCOPED", "_attr_values": ["APAC", "EMEA"]},
+          "PRODUCT_OWNER": {"_policy_mode": "ID_SCOPED", "_id_values": "$coverage"},
+          "EXTERNAL":      {"__deny": True, "reason": "EXTERNAL access requires an exact product_id — browsing isn't permitted."},
+      }
+
+  [Wizard equivalent: "Identity & access" step, or click "Skip — every user
+  sees the same data" if you don't need this at all.]
+
+
+STEP 4 — Seed demo data (optional, only if you want test data + demo logins)
+----------------------------------------------------------------------------
+If you want reproducible demo data (recommended for testing before this
+touches anything real), write backend/app/domains/revenue_and_returns/seed_data.py
+mirroring backend/app/domains/credit_facility/seed_data.py: generate rows
+for rr_product_master and rr_revenue_returns_monthly, plus (if Step 3
+applies) rr_user_persona / rr_user_product_coverage and a DEMO_USERS list
+of (email, persona) pairs backed by real login accounts. Support --reset.
+
+  [Wizard equivalent: none — demo data is always a script/manual step, the
+  wizard only ever points at data that already exists.]
+
+
+STEP 5 — Register the data entities (the data dictionary)
+---------------------------------------------------------
+Create one `data_entities` row per table the agent should be able to
+query. Each field needs: name, label, type, and whichever of
+searchable/filterable/visible/measure/format applies — see
+backend/app/models/data_entities.py's docstring for the exact shape.
+
+  Field list for rr_product_master ("rr_products" entity):
+      product_id      - string, filterable, visible
+      product_name    - string, searchable, visible
+      sku             - string, filterable, visible
+      business_unit   - string, visible
+      category        - string, visible
+      sub_category    - string, visible
+      region          - string, filterable, visible
+      product_level   - string, filterable, visible, enum ["L2","L3","L4"]
+
+  Field list for rr_revenue_returns_monthly ("rr_revenue_data" entity):
+      (all of the above, PLUS:)
+      load_id          - integer, filterable, visible          (label "Month (YYYYMM)")
+      gross_revenue    - decimal, measure, format=currency
+      returns_amount   - decimal, measure, format=currency
+      refund_amount    - decimal, measure, format=currency
+      net_revenue      - decimal, measure, format=currency
+      return_rate_pct  - decimal, measure, format=percent
+      units_sold       - integer, measure, format=integer
+      units_returned   - integer, measure, format=integer
+      num_orders       - integer, measure, format=integer
+
+  PATH B (script): call `_get_or_create_entity`-style code in a new
+  backend/app/domains/revenue_and_returns/seed_agent.py, following
+  backend/app/domains/credit_facility/seed_agent.py's ENTITY_SPECS dict
+  pattern EXACTLY (copy that file's structure).
+
+  PATH A (wizard): "Data entities" step — pick the connection, Test
+  connection, pick rr_product_master from the live table list (columns
+  auto-introspected and auto-tagged), repeat for rr_revenue_returns_monthly,
+  adjust any auto-tagged field if the heuristic guessed wrong.
+
+
+STEP 6 — Create the data_query_tool rows
+-----------------------------------------
+One tool per data entity. Do NOT hand-write `description` or
+`input_schema` — both are always server-composed from the entity via
+`_hydrate_data_query_tool` (backend/app/config_api/tools.py). You only ever
+supply `config.entity_id` (+ `config.policy_id` if Step 3 applies).
+
+  query_products       -> entity rr_products,      policy revenue_returns_search_access (or none)
+  query_revenue_data    -> entity rr_revenue_data,   policy revenue_returns_query_access (or none)
+
+  PATH B (script): TOOL_SPECS dict in seed_agent.py, exactly mirroring
+  credit_facility/seed_agent.py's TOOL_SPECS + the loop that calls
+  `_hydrate_data_query_tool` then constructs the `Tool` row with
+  `tool_type="data_query_tool"`.
+
+  PATH A (wizard): "Tools" step — one click ("create all tools").
+
+
+STEP 7 — Create and configure the agent
+------------------------------------------
+Name: `revenue_returns_analyst` (matches the `<domain>_analyst` naming
+convention for a specialist agent with no sub-agents — see README's
+"Orchestrator naming" note).
+
+  Suggested base_instruction (adapt credit_facility's — the structure below
+  is what makes a data_query_tool agent behave well; copy it, don't rewrite
+  it from scratch):
+
+    "You are the Revenue and Returns Analysis specialist. You answer
+    questions about product revenue, returns, and refunds by writing SQL
+    yourself against the tools' described schemas — there is no fixed
+    query behind either tool, you write a real SELECT statement each time.
+    1. Each tool's own description lists its exact table name and columns
+       — never reference a column that isn't listed.
+    2. If the user names a product and you don't already have its exact
+       product_id, call query_products first with a SELECT filtering
+       product_name (e.g. WHERE product_name LIKE '%...%'). If it returns
+       no rows or several plausible ones, tell the user what you found and
+       ask them to confirm — never guess a product_id.
+    3. If a tool call's result contains "error", explain that plainly and
+       do not retry with a guessed or invented value.
+    4. Call query_revenue_data with a SELECT filtered by the resolved
+       product_id. If no period was named, ORDER BY load_id DESC and show
+       the most recent row; if 'last N months', show the first N rows.
+    5. Present results as markdown tables using each column's label, not
+       its raw column name. Call out return rate trends and any unusually
+       high return_rate_pct explicitly.
+    6. Never fabricate numbers. If a tool call returns zero rows, say so
+       plainly rather than inventing figures."
+
+  model_config: {"model": "gemini-2.5-flash", "temperature": 0.1} (low
+  temperature — this is a data-lookup agent, not a creative one; matches
+  every other data_query_tool agent in this repo).
+
+  PATH B (script): the Agent + AgentTool + AgentVersion(version=1,
+  status="published") block at the bottom of credit_facility/seed_agent.py
+  — copy verbatim, swap names/instruction.
+
+  PATH A (wizard): "Agent" step — name/description/instruction fields,
+  each tool auto-attached.
+
+
+STEP 8 — Test and publish
+----------------------------
+PATH B (script): run it —
+    cd backend
+    python -m app.domains.revenue_and_returns.seed_data   [--reset]   (if Step 4 applies)
+    python -m app.domains.revenue_and_returns.seed_agent  [--reset]
+  This publishes immediately (trusted server-side code, no smoke-test
+  gate) — so test manually afterward via the Playground or /chat before
+  telling anyone it's live.
+
+PATH A (wizard): "Test & publish" step is MANDATORY and gated — it runs
+  the draft agent against a real question and REFUSES to let you publish
+  unless at least one real tool call was observed (an agent that "answers"
+  without querying is treated as hallucinating, not passing). Ask it
+  something like "What's the return rate for <a seeded product> in
+  <month>?" and confirm it actually calls query_products / query_revenue_data.
+
+Either path: also manually verify RLS if Step 3 applies — log in as two
+different demo personas and confirm each only sees their scoped
+products/regions (see credit_facility's worked RLS verification in
+SCIL_technical_document.md section 7.1 for the pattern: same question,
+different user_id, confirm different/no results as appropriate).
+
+
+STEP 9 — (Optional) Enable SCIL on the new agent
+---------------------------------------------------
+Once the agent is live and working, consider enabling SCIL (the
+Self-Correcting Intelligence Layer — see SCIL_technical_document.md) for
+caching + auto-correction:
+
+    UPDATE agents
+    SET model_config = jsonb_set(
+        model_config, '{scil}',
+        '{"enabled": true, "cache_ttl_hours": 24, "validators": ["sql", "entity_resolution"]}'::jsonb,
+        true
+    )
+    WHERE trim(name) = 'revenue_returns_analyst' AND status != 'archived';
+
+  - "sql" validator: catches malformed/unsafe SQL and retries automatically.
+  - "entity_resolution" validator: catches a misspelled product name that
+    returns zero rows (e.g. a user typing "Widgit Pro" instead of "Widget
+    Pro") and retries with the corrected name once this agent has
+    successfully resolved that product name at least once before — see
+    SCIL_technical_document.md's entities.py section for exactly how this
+    works and why it needed a blended embedding+lexical similarity score,
+    not sentence-transformer similarity alone.
+  - If this domain uses RLS (Step 3), also set "cache_scope": "user" so
+    one persona's cached answer is never served to another — this is NOT
+    optional if RLS is in play (see SCIL_technical_document.md section 7.1).
+
+
+PART 3 — FILE CHECKLIST (what you'd actually create/touch)
+============================================================================
+
+  [created]  backend/app/domains/revenue_and_returns/schema.sql   (done — this guide ships it)
+  [created]  backend/app/domains/revenue_and_returns/__init__.py
+  [created]  backend/app/domains/revenue_and_returns/mysql_client.py    (copy credit_facility's, swap names/DDL)
+  [optional] backend/app/domains/revenue_and_returns/policy_config.py  (only if Step 3 applies)
+  [optional] backend/app/domains/revenue_and_returns/seed_data.py      (only if you want demo data)
+  [created]  backend/app/domains/revenue_and_returns/seed_agent.py     (entities + tools + agent)
+  [touched]  backend/.env                                              (new REVENUE_RETURNS_MYSQL_* vars)
+  [touched]  README.md                                                 (add a short section, matching the
+                                                                          existing Credit Facility Analysis
+                                                                          entry, once this is real)
+
+None of these require touching backend/app/tool_registry/, backend/app/models/,
+or any other platform-level code — that is precisely the point of the
+generic data_query_tool + access_policies design (see Part 0).
