@@ -200,7 +200,7 @@ async def _build_from_live_config(
     return AdkAgent(
         name=_safe_agent_name(agent.name),
         description=agent.description or "",
-        model=_resolve_model(agent.model_config_json.get("model", "gemini-2.5-flash")),
+        model=_resolve_model(agent.model_config_json.get("model", "gemini-3.5-flash")),
         instruction=compose_instruction(agent.base_instruction, skills),
         tools=tools,
         sub_agents=sub_agents,
@@ -280,7 +280,7 @@ async def _build_from_snapshot(
     return AdkAgent(
         name=_safe_agent_name(snapshot["name"]),
         description=snapshot.get("description") or "",
-        model=_resolve_model(snapshot["model_config"].get("model", "gemini-2.5-flash")),
+        model=_resolve_model(snapshot["model_config"].get("model", "gemini-3.5-flash")),
         instruction=compose_instruction(snapshot["base_instruction"], skills),
         tools=tools,
         sub_agents=sub_agents,

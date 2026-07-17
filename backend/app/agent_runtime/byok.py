@@ -121,13 +121,15 @@ def resolve_request_api_keys(
     /chat/message/stream) — per product decision, public traffic must never
     silently spend the operator's own quota.
 
-    allow_operator_fallback=True for Playground (/playground/run) and
-    /invoke — both are require_role("admin"/"developer")-gated internal
-    tooling, not public traffic, so falling back to the operator's key there
-    is the right default (lets a developer iterate on a Claude-model agent
-    without needing their own Anthropic key on hand). A caller who supplies
-    their own key anyway still takes priority over the operator fallback —
-    the header mechanism works identically either way.
+    allow_operator_fallback=True for admin callers of Playground
+    (/playground/run) and /invoke (admin-only) — internal tooling, not
+    public traffic, so falling back to the operator's key is the right
+    default for them. False for developer-role Playground callers: per
+    product decision, a developer's own usage should spend their own
+    provider quota, not the operator's — same strict behavior as public
+    chat. A caller who supplies their own key anyway still takes priority
+    over the operator fallback — the header mechanism works identically
+    either way.
     """
     from app.config import get_settings
 

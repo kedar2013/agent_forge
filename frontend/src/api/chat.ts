@@ -23,7 +23,7 @@ export class MissingApiKeyError extends ChatApiError {
   }
 }
 
-async function parseError(res: Response): Promise<never> {
+export async function parseError(res: Response): Promise<never> {
   let detail = res.statusText
   try {
     const body = await res.json()
@@ -40,7 +40,7 @@ async function parseError(res: Response): Promise<never> {
 
 /** Both provider-key headers, only set when the caller actually has a key
  * stored — omitting an empty header rather than sending a blank string. */
-function providerKeyHeaders(): Record<string, string> {
+export function providerKeyHeaders(): Record<string, string> {
   const headers: Record<string, string> = {}
   const geminiKey = getProviderKey('gemini')
   const anthropicKey = getProviderKey('anthropic')

@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { Bot, Send, User, Wrench } from 'lucide-react'
 import { toast } from 'sonner'
+import { MissingApiKeyError } from '../../api/chat'
 import { useRunPlayground } from '../../api/playground'
 import type { ToolCallTrace } from '../../api/types'
+import type { Provider } from '../../lib/providerKeys'
 import { markTestedIfPending } from '../../lib/testGate'
+import ApiKeyPrompt from '../chat/ApiKeyPrompt'
 import { AssistantContent, fmtTime, TypingIndicator } from '../chat/MessageRendering'
 import Button from '../ui/Button'
 import Card from '../ui/Card'
@@ -27,6 +30,16 @@ export default function PlaygroundChat({ agentId }: { agentId: string }) {
   const runPlayground = useRunPlayground()
   const nextTurnIndex = useRef(0)
   const scrollRef = useRef<HTMLDivElement>(null)
+  // Set when a run fails with MissingApiKeyError (developer role, no key on
+  // file yet — see backend/app/playground_api/router.py) — opens
+  // ApiKeyPrompt instead of a normal error bubble, and remembers the
+  // message + turnIndex so retrying after a key is supplied doesn't push a
+  // duplicate user bubble or desync the tool-call trace's turn numbering.
+  const [pendingKeyPrompt, setPendingKeyPrompt] = useState<{
+    provider: Provider
+    message: string
+    turnIndex: number
+  } | null>(null)
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
@@ -35,7 +48,7 @@ export default function PlaygroundChat({ agentId }: { agentId: string }) {
   // Shared by the compose-box submit AND by clicking a chip in
   // AssistantContent's OptionsView — same "send this value as the next
   // message" flow as ChatPage.tsx's submitMessage.
-  async function submitMessage(message: string) {
+  async function submitMessage(message: string, opts?: { skipUserTurn?: boolean; turnIndex?: number }) {
     if (!message) return
 
     let stateDelta: Record<string, unknown> | undefined
@@ -48,8 +61,10 @@ export default function PlaygroundChat({ agentId }: { agentId: string }) {
       return
     }
 
-    const turnIndex = nextTurnIndex.current++
-    setTurns((prev) => [...prev, { role: 'user', text: message, turnIndex, at: Date.now() }])
+    const turnIndex = opts?.turnIndex ?? nextTurnIndex.current++
+    if (!opts?.skipUserTurn) {
+      setTurns((prev) => [...prev, { role: 'user', text: message, turnIndex, at: Date.now() }])
+    }
 
     try {
       const result = await runPlayground.mutateAsync({
@@ -70,6 +85,10 @@ export default function PlaygroundChat({ agentId }: { agentId: string }) {
       ])
       markTestedIfPending(agentId)
     } catch (err) {
+      if (err instanceof MissingApiKeyError) {
+        setPendingKeyPrompt({ provider: err.provider, message, turnIndex })
+        return
+      }
       setTurns((prev) => [
         ...prev,
         { role: 'assistant', text: (err as Error).message, turnIndex, at: Date.now(), isError: true },
@@ -212,6 +231,18 @@ export default function PlaygroundChat({ agentId }: { agentId: string }) {
           ))}
         </div>
       </Card>
+
+      {pendingKeyPrompt && (
+        <ApiKeyPrompt
+          provider={pendingKeyPrompt.provider}
+          onClose={() => setPendingKeyPrompt(null)}
+          onSubmit={() => {
+            const { message, turnIndex } = pendingKeyPrompt
+            setPendingKeyPrompt(null)
+            submitMessage(message, { skipUserTurn: true, turnIndex })
+          }}
+        />
+      )}
     </div>
   )
 }

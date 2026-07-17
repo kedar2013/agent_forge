@@ -572,7 +572,7 @@ async def _stream_turn(
         response_text = _fallback_text_from_tool_calls(tool_calls) or (
             "Sorry, I couldn't come up with an answer to that — could you try rephrasing?"
         )
-    model = agent_row.model_config_json.get("model", "gemini-2.5-flash")
+    model = agent_row.model_config_json.get("model", "gemini-3.5-flash")
     error_category = classify_error(
         status=status, error_message=error_message, events=events, tool_call_records=tool_call_records
     )
@@ -901,7 +901,7 @@ async def _run_turn(
             remember_entities_fire_and_forget(agent_row.id, outcome.tool_calls)
 
     latency_ms = int((time.monotonic() - start) * 1000)
-    model = agent_row.model_config_json.get("model", "gemini-2.5-flash")
+    model = agent_row.model_config_json.get("model", "gemini-3.5-flash")
     error_category = classify_error(
         status=outcome.status,
         error_message=outcome.error_message,
@@ -999,12 +999,16 @@ async def run_playground(
     user_id = payload.user_id or "playground-user"
     session_id = payload.session_id or f"playground-{uuid.uuid4()}"
 
-    # BYOK: Playground is require_role("admin"/"developer")-gated internal
-    # tooling, not public traffic — falls back to the operator's own key so
-    # a developer can iterate on a Claude-model agent without needing their
-    # own Anthropic key on hand. A supplied header still takes priority.
+    # BYOK: admins fall back to the operator's own key (internal tooling,
+    # not public traffic). Developers must supply their own key — per
+    # product decision, a developer's Playground usage should spend their
+    # own provider quota, not the operator's, mirroring public chat's
+    # strict behavior. A supplied header always takes priority either way.
     gemini_key, anthropic_key = resolve_request_api_keys(
-        required_providers(adk_agent), x_gemini_api_key, x_anthropic_api_key, allow_operator_fallback=True
+        required_providers(adk_agent),
+        x_gemini_api_key,
+        x_anthropic_api_key,
+        allow_operator_fallback=(principal.role == "admin"),
     )
 
     try:
