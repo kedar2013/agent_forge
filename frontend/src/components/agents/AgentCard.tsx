@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { Archive, Copy, Download, History, Sparkles, Wrench, Workflow } from 'lucide-react'
+import { Archive, Bot, Copy, Download, History, Sparkles, Wrench, Workflow } from 'lucide-react'
 import { toast } from 'sonner'
 import { exportAgent, useArchiveAgent, useCloneAgent } from '../../api/agents'
 import type { Agent } from '../../api/types'
@@ -8,6 +8,7 @@ import { AGENT_STATUS_TONE } from '../../lib/badgeTones'
 import Badge from '../ui/Badge'
 import Card from '../ui/Card'
 import ConfirmDialog from '../ui/ConfirmDialog'
+import EntityAvatar, { type EntityAvatarState } from '../ui/EntityAvatar'
 import Modal from '../ui/Modal'
 import VersionHistory from './VersionHistory'
 
@@ -18,6 +19,8 @@ export default function AgentCard({ agent, compact = false }: { agent: Agent; co
   const [confirmArchive, setConfirmArchive] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
   const isOrchestrator = agent.sub_agents.length > 0
+  const avatarState: EntityAvatarState =
+    agent.status === 'draft' ? 'ghost' : agent.status === 'archived' ? 'muted' : 'active'
 
   function handleArchive() {
     archiveAgent.mutate(agent.id, {
@@ -87,7 +90,13 @@ export default function AgentCard({ agent, compact = false }: { agent: Agent; co
           }`}
         >
           <Link to={`/agents/${agent.id}`} className="flex min-w-0 flex-1 items-center gap-2">
-            {isOrchestrator && <Workflow size={14} className="shrink-0 text-violet-600 dark:text-violet-400" />}
+            <EntityAvatar
+              icon={isOrchestrator ? Workflow : Bot}
+              tone={AGENT_STATUS_TONE[agent.status]}
+              state={avatarState}
+              glow={agent.status === 'published'}
+              size={28}
+            />
             <span className="truncate text-sm font-semibold text-slate-900 hover:text-brand-600 dark:text-slate-100 dark:hover:text-brand-400">
               {agent.name}
             </span>
@@ -114,10 +123,14 @@ export default function AgentCard({ agent, compact = false }: { agent: Agent; co
           }`}
         >
           <div className="flex items-start justify-between gap-2">
-            <Link to={`/agents/${agent.id}`} className="flex min-w-0 flex-1 items-center gap-1.5">
-              {isOrchestrator && (
-                <Workflow size={15} className="shrink-0 text-violet-600 dark:text-violet-400" />
-              )}
+            <Link to={`/agents/${agent.id}`} className="flex min-w-0 flex-1 items-center gap-2.5">
+              <EntityAvatar
+                icon={isOrchestrator ? Workflow : Bot}
+                tone={AGENT_STATUS_TONE[agent.status]}
+                state={avatarState}
+                glow={agent.status === 'published'}
+                size={40}
+              />
               <h3 className="truncate font-semibold text-slate-900 hover:text-brand-600 dark:text-slate-100 dark:hover:text-brand-400">
                 {agent.name}
               </h3>

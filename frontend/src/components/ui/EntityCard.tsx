@@ -5,6 +5,9 @@ import Card from './Card'
 
 export interface EntityCardProps {
   title: string
+  /** An <EntityAvatar> — optional so AccessPolicy/DataEntity cards (which
+   * don't pass one) render exactly as before; Tool/Skill cards opt in. */
+  avatar?: ReactNode
   /** Row of <Badge> elements. */
   badges?: ReactNode
   description?: ReactNode
@@ -23,7 +26,17 @@ export interface EntityCardProps {
  * DataEntity cards — each of those still owns its own state (which
  * modal/confirm-dialog is open) and delete mutation; this component is
  * rendering only. */
-export default function EntityCard({ title, badges, description, meta, compact = false, onEdit, onDelete, entityLabel }: EntityCardProps) {
+export default function EntityCard({
+  title,
+  avatar,
+  badges,
+  description,
+  meta,
+  compact = false,
+  onEdit,
+  onDelete,
+  entityLabel,
+}: EntityCardProps) {
   function stop(e: MouseEvent, fn: () => void) {
     e.stopPropagation()
     fn()
@@ -55,6 +68,7 @@ export default function EntityCard({ title, badges, description, meta, compact =
   if (compact) {
     return (
       <Card hover onClick={onEdit} className="group flex items-center gap-3 py-2.5">
+        {avatar}
         <span className="truncate text-sm font-semibold text-slate-900 group-hover:text-brand-600 dark:text-slate-100 dark:group-hover:text-brand-400">
           {title}
         </span>
@@ -68,9 +82,12 @@ export default function EntityCard({ title, badges, description, meta, compact =
   return (
     <Card hover onClick={onEdit} className="group flex flex-col gap-3">
       <div className="flex items-start justify-between gap-2">
-        <h3 className="truncate font-semibold text-slate-900 group-hover:text-brand-600 dark:text-slate-100 dark:group-hover:text-brand-400">
-          {title}
-        </h3>
+        <div className="flex min-w-0 items-center gap-2.5">
+          {avatar}
+          <h3 className="truncate font-semibold text-slate-900 group-hover:text-brand-600 dark:text-slate-100 dark:group-hover:text-brand-400">
+            {title}
+          </h3>
+        </div>
         <div className="flex shrink-0 items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">{actionButtons}</div>
       </div>
       {badges && <div className="flex items-center gap-2">{badges}</div>}

@@ -9,6 +9,8 @@ export type ToolType =
   | 'mongo_query_tool'
   | 'mysql_query_tool'
   | 'data_query_tool'
+  | 'self_healing_sql_tool'
+  | 'read_scratchpad_tool'
 export type AgentStatus = 'draft' | 'published' | 'archived'
 
 export interface JsonSchemaProperty {

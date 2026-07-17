@@ -1,9 +1,11 @@
+import { Sparkles } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
 import { useDeleteSkill } from '../../api/skills'
 import type { Skill } from '../../api/types'
 import Badge from '../ui/Badge'
 import ConfirmDialog from '../ui/ConfirmDialog'
+import EntityAvatar from '../ui/EntityAvatar'
 import EntityCard from '../ui/EntityCard'
 import Modal from '../ui/Modal'
 import SkillForm from './SkillForm'
@@ -48,6 +50,7 @@ export default function SkillCard({ skill, compact = false }: { skill: Skill; co
     <>
       <EntityCard
         title={skill.name}
+        avatar={<EntityAvatar icon={Sparkles} tone="violet" size={compact ? 28 : 40} />}
         badges={badges}
         description={skill.instruction_text || undefined}
         meta={`Updated ${new Date(skill.updated_at).toLocaleDateString()}`}

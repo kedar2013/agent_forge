@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react'
 import type { LucideIcon } from 'lucide-react'
 import Card from '../ui/Card'
+import EntityAvatar from '../ui/EntityAvatar'
 
 /** Generic "live preview" shell shared by every everyday creation form
  * (New Agent, New Tool, New Skill) — the same ghost-until-named,
@@ -30,15 +31,7 @@ export default function PreviewCardShell({
     <div className="sticky top-4">
       <Card>
         <div className="flex items-center gap-3">
-          <div
-            className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-full text-white transition-colors duration-500 ${
-              isActive
-                ? 'animate-canvas-glow bg-gradient-to-br from-brand-500 to-accent-500'
-                : 'animate-pulse border-2 border-dashed border-slate-300 text-slate-300 dark:border-slate-700 dark:text-slate-700'
-            }`}
-          >
-            <Icon size={22} />
-          </div>
+          <EntityAvatar icon={Icon} state={isActive ? 'active' : 'ghost'} glow={isActive} size={48} />
           <div className="min-w-0 flex-1">
             {isActive ? (
               <h3 key={title} className="animate-canvas-reveal truncate font-semibold text-slate-900 dark:text-slate-100">
