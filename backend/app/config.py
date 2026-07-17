@@ -1,7 +1,7 @@
 import os
 from functools import lru_cache
 
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -10,6 +10,20 @@ class Settings(BaseSettings):
 
     database_url: str
     db_schema: str = "agent_forge"
+
+    @field_validator("database_url")
+    @classmethod
+    def _force_asyncpg_driver(cls, v: str) -> str:
+        """Managed-Postgres hosts (Railway, Heroku, ...) hand out
+        "postgres://"/"postgresql://" with no driver, which SQLAlchemy
+        resolves to the sync psycopg2 dialect — not installed here since
+        app/db.py's create_async_engine needs an async driver. Rewrite to
+        asyncpg so those hosts' connection strings work unmodified."""
+        if v.startswith("postgres://"):
+            v = "postgresql://" + v[len("postgres://") :]
+        if v.startswith("postgresql://"):
+            v = "postgresql+asyncpg://" + v[len("postgresql://") :]
+        return v
 
     gemini_api_key: str
     gemini_model: str = "gemini-2.5-flash"
