@@ -26,6 +26,7 @@ from app.db import async_session_factory
 from app.debug_api.router import router as debug_router
 from app.observability.tracing import setup_tracing
 from app.playground_api.router import invoke_router, router as playground_router
+from app.prompt_eval_api.router import router as prompt_eval_router
 from app.reliability_api.router import router as reliability_router
 from app.scil_api.router import router as scil_router
 
@@ -84,6 +85,7 @@ app.include_router(retention_router, prefix="/api")
 app.include_router(debug_router, prefix="/api")
 app.include_router(scil_router, prefix="/api")
 app.include_router(reliability_router, prefix="/api")
+app.include_router(prompt_eval_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
 

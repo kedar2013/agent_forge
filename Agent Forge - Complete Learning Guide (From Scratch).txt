@@ -1,0 +1,1990 @@
+================================================================================
+AGENT FORGE — A COMPLETE LEARNING GUIDE, FROM SCRATCH
+================================================================================
+Written for: someone who has never touched Google ADK, FastAPI-at-this-scale,
+or a modern React+Vite frontend, and wants to understand this specific
+codebase deeply enough to work in it confidently.
+
+How to read this: Part 1 is the 5-minute mental model. Part 2 teaches every
+underlying framework/technology from first principles — generic knowledge,
+useful even outside this repo. Part 3 is this project's actual architecture,
+constantly referring back to Part 2 ("this is the X concept you just learned,
+used like this"). Part 4 is a glossary. Part 5 is a suggested reading order
+through the real source files. You do not have to read it linearly — jump to
+whatever section you need — but Part 2 is written assuming zero prior
+exposure, and Part 3 is written assuming you've read Part 2.
+
+Every code snippet below is copied verbatim from this repository (not
+paraphrased/invented), with a file path so you can open the real thing.
+
+TABLE OF CONTENTS
+
+PART 1 — THE FIVE-MINUTE MENTAL MODEL
+PART 2 — FOUNDATIONS (every framework, taught from scratch)
+  2.1  What is an "AI agent" / agent framework, generically
+  2.2  Google ADK — Agent Development Kit, in depth
+  2.3  FastAPI, in depth
+  2.4  SQLAlchemy 2.0 (async) + Alembic, in depth
+  2.5  PostgreSQL + pgvector, in depth
+  2.6  MySQL alongside Postgres — why two databases
+  2.7  MCP — the Model Context Protocol
+  2.8  React + TypeScript + Vite + Tailwind CSS, in depth
+  2.9  TanStack Query (React Query), in depth
+  2.10 React Router, in depth
+  2.11 Docker + Railway, in depth
+  2.12 OpenTelemetry + Jaeger, in depth
+PART 3 — THIS PROJECT'S ARCHITECTURE (the real system)
+  3.1  System architecture and one request's full journey
+  3.2  Data model / database schema
+  3.3  Roles, permissions, and ownership
+  3.4  Agent Runtime — builder.py, annotated line by line
+  3.5  Multi-Agent Orchestration Framework
+  3.6  Planner / ReAct reasoning
+  3.7  Tool Registry — every tool type explained
+  3.8  MCP servers in this repo
+  3.9  SCIL — Self-Correcting Intelligence Layer
+  3.10 Durable Execution & Reliability layer
+  3.11 Domains built on the platform (worked examples)
+  3.12 Publish, versioning, and the approval workflow
+  3.13 Frontend architecture, in depth
+  3.14 Security model
+  3.15 Hosting & deployment (Docker, Railway, this project's real deployment)
+  3.16 Testing philosophy
+  3.17 Scripts — how the database actually gets populated
+PART 4 — GLOSSARY
+PART 5 — SUGGESTED READING ORDER THROUGH THE REAL CODE
+
+================================================================================
+PART 1 — THE FIVE-MINUTE MENTAL MODEL
+================================================================================
+
+Agent Forge is a platform where "building an AI agent" means filling in a
+database row, not writing a Python file. An "agent" is a name, an instruction
+(system prompt), a model choice, and a list of attached tools/skills/other
+agents — all just columns in a Postgres table. A backend service (FastAPI +
+Google ADK) reads that row and turns it into a real, running AI agent object
+at request time. A frontend (React) is the form-filling UI for building and
+testing those rows, plus a chat surface for end users to actually talk to
+the published agents.
+
+Two runtime pieces sit on top of "just run the agent":
+  - SCIL: caches validated answers and auto-corrects bad tool-generated SQL/
+    JSON, to cut cost and fix mistakes without a human.
+  - Durable Execution / Reliability: makes multi-step tool-calling turns
+    survive a crash, retries flaky downstream calls, and rolls back
+    ("compensates") partially-completed multi-step actions when a later step
+    fails.
+
+Two databases: Postgres holds the platform's OWN configuration (agents,
+tools, users, audit log, SCIL memory). MySQL holds DOMAIN business data
+(credit facility numbers, revenue/returns numbers, sales data) — kept
+separate so "the platform's own settings" and "a customer's actual data"
+never mix.
+
+Everything is governed: every config change is audit-logged in a tamper-
+evident (hash-chained) way, every tool call that touches row-level data goes
+through a policy-enforcement callback the LLM cannot see or influence, and a
+non-admin developer's published agents go through an approval queue before
+going live.
+
+================================================================================
+PART 2 — FOUNDATIONS
+================================================================================
+
+--------------------------------------------------------------------------------
+2.1 WHAT IS AN "AI AGENT" / AGENT FRAMEWORK, GENERICALLY
+--------------------------------------------------------------------------------
+
+A plain LLM call is: you send text in, you get text back. That's a chatbot,
+not an agent — it can't DO anything, it can only talk.
+
+An "agent" adds two things on top of a plain LLM call:
+  1. TOOLS — functions the model is told about (name, description, JSON
+     schema of arguments) that it can ask to have executed. The model itself
+     never runs code; it emits a structured "please call function X with
+     these arguments" message, the AGENT FRAMEWORK actually executes that
+     function in real Python/whatever, and feeds the result back to the model
+     as if it were part of the conversation. The model then continues
+     reasoning with that new information.
+  2. A LOOP — the framework keeps sending the model's tool-call requests to
+     real functions and feeding results back until the model produces a
+     final, tool-call-free answer. This loop is usually called "the agent
+     loop" or "ReAct" (Reason + Act) informally.
+
+On top of that, MULTI-AGENT systems let one agent "hand off" a conversation
+to a different agent better suited to the current sub-topic (e.g. a general
+router agent handing off to a specialist). This is usually implemented as
+just another tool call — "transfer control to agent named X" — the receiving
+agent then continues the SAME conversation history with its own instructions
+and tools active instead.
+
+Google's ADK (Agent Development Kit), which this project is built on, is one
+concrete, production-grade implementation of all of the above. LangChain,
+LlamaIndex, CrewAI, OpenAI's Assistants API, and Anthropic's own tool-use
+API are other implementations of largely the same ideas, with different
+vocabulary. Once you understand "tools are schemas the model requests but
+never executes itself" and "an agent loop is who executes the requested tool
+and feeds the result back," every one of those frameworks becomes a
+vocabulary-mapping exercise, not new knowledge.
+
+--------------------------------------------------------------------------------
+2.2 GOOGLE ADK — AGENT DEVELOPMENT KIT, IN DEPTH
+--------------------------------------------------------------------------------
+
+This project pins `google-adk[mcp]==2.4.0` exactly (see `backend/pyproject.
+toml`) — not a version range, because a later ADK release renamed a symbol
+this app imports (more on that below). Everything in this section describes
+ADK 2.4.0's actual API surface as this codebase uses it.
+
+THE CORE OBJECTS
+
+  `google.adk.agents.Agent` (imported here as `AdkAgent` — see
+  `backend/app/agent_runtime/builder.py` line 4: `from google.adk.agents
+  import Agent as AdkAgent`) — one node in an agent tree. Constructor
+  arguments this project actually sets (from `builder.py`'s
+  `_build_from_live_config`):
+
+    AdkAgent(
+        name=...,                     # must be a valid identifier, no spaces
+        description=...,              # used by a PARENT agent's routing
+                                       # decision, not shown to the end user
+        model=...,                    # a bare Gemini model string, OR a
+                                       # BaseLlm instance (see LiteLlm below)
+        instruction=...,               # the system prompt
+        tools=[...],                   # list of BaseTool / BaseToolset
+        sub_agents=[...],              # list of other AdkAgent instances —
+                                       # this is what makes multi-agent work
+        before_tool_callback=...,      # fires before EVERY tool call
+        after_tool_callback=...,       # fires after EVERY tool call
+        output_schema=...,             # optional: force structured JSON out
+        output_key=...,                # optional: where to stash the result
+                                       # in session state
+        planner=...,                   # optional: PlanReActPlanner() — see
+                                       # 3.6
+        disallow_transfer_to_parent=False,  # allow a sub-agent to hand back
+    )
+
+  An agent tree is just nested `AdkAgent` objects: a root orchestrator with
+  `sub_agents=[specialist_a, specialist_b, ...]`, where each specialist can
+  itself have its own tools and (in principle) its own further sub_agents.
+
+  `google.adk.runners.Runner` — the actual "run this agent against this
+  message, in this session" driver. You construct one (per turn, in this
+  codebase — see `playground_api/router.py`) with the root agent, an "app"
+  wrapper, and a session service, then call `runner.run_async(user_id=...,
+  session_id=..., new_message=...)`, which is an ASYNC GENERATOR yielding
+  `Event` objects as the model thinks/calls tools/produces text, one event at
+  a time, in real time. You iterate over it with `async for event in
+  runner.run_async(...):`.
+
+  `google.adk.apps.app.App` — a thin wrapper around a root agent that also
+  carries cross-cutting config, notably `ResumabilityConfig` (see 3.10 for
+  how this project uses it for crash recovery).
+
+  SESSIONS AND SESSION SERVICES — ADK needs somewhere to persist "this
+  conversation's message history and any session-scoped state" between
+  turns. It ships multiple `BaseSessionService` implementations; this
+  project uses exactly two:
+    - `InMemorySessionService` — lives only in this process's RAM, gone on
+      restart. Used for the Playground (`_playground_sessions` in
+      `playground_api/router.py`) — a throwaway test run against a draft
+      config SHOULD forget itself on restart.
+    - `DatabaseSessionService` — backed by a real database (this project
+      points it at the same Postgres via `db_url=get_settings().
+      database_url`). Used for `/invoke` (`_invoke_sessions`) — production
+      traffic that must survive a backend restart.
+
+  `ToolContext` — passed into every tool's `run_async(args, tool_context)`
+  and into `before_tool_callback`/`after_tool_callback`. Carries:
+    - `tool_context.state` — a dict-like session-scoped key/value store any
+      tool or callback can read/write; this is how "context param
+      injection" and "durable-execution idempotency caching" both work (see
+      3.4).
+    - `tool_context.invocation_id` — a stable id unique to ONE top-level
+      `runner.run_async()` call (one user turn) — used as a natural,
+      no-reset-needed counter key.
+    - `tool_context.function_call_id` — identifies one specific tool-call
+      attempt within a turn.
+
+  FUNCTION TOOLS AND `BaseTool` — the simplest way to give a model a
+  capability is a plain Python function; ADK auto-wraps it as a
+  `FunctionTool`. This project instead subclasses ADK's `BaseTool` directly
+  (see `backend/app/tool_registry/base.py`) because every tool here is
+  DATA-DRIVEN — its JSON schema comes from a database row, not from
+  introspecting a Python function's type hints:
+
+      class ConfigDrivenTool(BaseTool):
+          def __init__(self, *, name, description, input_schema):
+              super().__init__(name=name, description=description or name)
+              self._input_schema = input_schema
+
+          def _get_declaration(self):
+              return types.FunctionDeclaration(
+                  name=self.name,
+                  description=self.description,
+                  parameters_json_schema=self._input_schema or {...},
+              )
+
+          async def run_async(self, *, args, tool_context):
+              raise NotImplementedError   # every subclass fills this in
+
+  Notably: `transfer_to_agent`, the mechanism a model uses to hand off to a
+  sub-agent, is ITSELF just another `FunctionTool` under the hood
+  ("TransferToAgentTool extends FunctionTool") — meaning it flows through
+  the exact same `before_tool_callback`/`after_tool_callback` as every other
+  tool call. This project exploits that fact directly (see 3.4's
+  transfer-hop cap).
+
+  `BaseToolset` — some "tools" are actually a whole CONNECTION to an
+  external process/server exposing several callable tools at once (see MCP,
+  section 2.7/3.8). `McpToolset` is ADK's `BaseToolset` implementation for
+  this — it owns a live subprocess or HTTP session and must be explicitly
+  `.close()`d when done, or the subprocess leaks (see 3.4's
+  `close_agent_toolsets`).
+
+  MODEL ROUTING — a bare string like `"gemini-3.5-flash"` is ADK's native
+  path (Gemini via Google's own client). To use a different model FAMILY
+  (Anthropic/Claude, in this project), ADK offers `google.adk.models.
+  lite_llm.LiteLlm` — an adapter wrapping the third-party `litellm` library,
+  which itself knows how to call dozens of different model providers behind
+  one interface. Passing `model=LiteLlm(model="anthropic/claude-...")`
+  instead of a bare string switches that one agent node to Claude, with
+  everything else (tools, sub_agents, callbacks) working identically —
+  ADK/your code doesn't need to know or care which provider is actually
+  answering.
+
+  PLANNERS — `google.adk.planners.PlanReActPlanner` (see 3.6) is an
+  optional add-on that changes HOW the model is instructed to reason: it
+  appends extra system-prompt text asking the model to structure its
+  response with explicit `/*PLANNING*/.../*ACTION*/.../*FINAL_ANSWER*/` tags,
+  and ADK's own response-processing (`flows/llm_flows/_nl_planning.py`)
+  splits those tagged sections apart, marking the reasoning portions with
+  `part.thought = True` so a caller can hide them from the end user while
+  still logging them for debugging. Contrast with `BuiltInPlanner` (not used
+  here), which instead turns on a model's NATIVE "thinking" feature
+  (e.g. Gemini's own extended-thinking mode) rather than asking for a
+  specific text format — `PlanReActPlanner` is purely instructional and
+  therefore only as reliable as the model's willingness to actually follow
+  that formatting instruction.
+
+  RESUMABILITY — `google.adk.apps.app.ResumabilityConfig` (marked
+  `@experimental` in ADK 2.4.0) is ADK's own primitive for "if this process
+  crashes mid-turn, a later call with `new_message=None` against the same
+  session continues from the last persisted event" — see 3.10 for how this
+  project builds real crash-recovery on top of it, and what gap ADK
+  explicitly leaves open (tool-call idempotency) that this project's own
+  code closes.
+
+WHY THE EXACT VERSION PIN MATTERS (a real lesson in dependency management)
+
+  `google-adk[mcp]==2.4.0` — pinned exact, not `>=2.4.0`, for a concrete,
+  previously-hit reason: version 2.5.0 renamed/dropped the `McpToolset`
+  symbol this app imports in favor of `MCPToolset`-only. Worse, ADK's own
+  `tools/mcp_tool/__init__.py` wraps its `McpToolset`/`MCPToolset` imports in
+  a bare `except ImportError: pass` — so if the optional `[mcp]` extra's own
+  dependencies (`mcp>=1.24,<2`, `anyio>=4.9,<5`) aren't installed, the symbol
+  silently doesn't exist at all, with NO error pointing at "mcp" or "anyio."
+  Two lessons generalize past this specific bug: (1) a library that silently
+  swallows an ImportError in its own `__init__.py` can make an entire
+  feature vanish with zero diagnostic trail — always suspect this when an
+  attribute "doesn't exist" with no exception; (2) pin exact versions for
+  any dependency where you've already been burned by a breaking change in a
+  point release, and say so in a comment, so the NEXT person doesn't
+  "helpfully" loosen the pin.
+
+--------------------------------------------------------------------------------
+2.3 FASTAPI, IN DEPTH
+--------------------------------------------------------------------------------
+
+FastAPI is a Python web framework built on Starlette (ASGI) + Pydantic. Core
+ideas, taught from scratch:
+
+  ASGI / ASYNC — unlike older frameworks (Flask, Django's classic WSGI
+  mode) that handle one request per worker thread at a time, FastAPI runs on
+  an async event loop (via `uvicorn`, the ASGI server this project uses —
+  see `docker-entrypoint.sh`'s `exec uvicorn app.main:app ...`). An endpoint
+  declared `async def` can `await` a database query or an HTTP call WITHOUT
+  blocking the whole process — other requests keep being served on the same
+  thread while one is waiting on I/O. This project's entire database layer
+  is async (SQLAlchemy's async engine + `asyncpg` driver) specifically to
+  take advantage of this.
+
+  ROUTERS — `APIRouter` groups related endpoints so they can be defined in
+  their own file and mounted onto the main `FastAPI()` app later. This
+  project has one router file per resource/subsystem — `chat_api/router.py`,
+  `playground_api/router.py`, `config_api/agents.py`, `reliability_api/
+  router.py`, and so on — each ending in something like:
+
+      router = APIRouter(prefix="/playground", tags=["playground"])
+
+      @router.post("/run")
+      async def run_playground(...): ...
+
+  and `app/main.py` wires every one of them onto the single app instance:
+
+      app.include_router(playground_router, prefix="/api")
+
+  so the real path becomes `/api/playground/run`. Registration ORDER
+  matters when two routers could match the same URL shape — `main.py`
+  has a comment explaining exactly this: `/agents/import` (a literal path)
+  must be registered before `/agents/{agent_id}` (a wildcard path) or
+  Starlette's first-match-wins routing would treat "import" as an agent id.
+
+  DEPENDENCY INJECTION (`Depends`) — instead of every endpoint manually
+  parsing the Authorization header or opening a DB session, FastAPI lets you
+  declare a parameter as `Depends(some_function)`; FastAPI calls that
+  function for you and injects its return value. This project uses this for:
+    - `db: AsyncSession = Depends(get_db)` — a fresh database session per
+      request (see `app/db.py`).
+    - `principal: Principal = Depends(require_role("admin"))` — this
+      project's OWN authentication/authorization dependency (see
+      `app/principal.py`) that parses the Bearer token, resolves who's
+      calling and their role, and raises a 403 automatically if their role
+      isn't in the allowed set — this is why the design doc can say "every
+      backend route depends on `require_role(...)` ... so access control
+      lives in one place."
+
+  PYDANTIC MODELS — every request body and response shape is declared as a
+  Pydantic class (see `backend/app/schemas/*.py`, one file per resource).
+  FastAPI uses these for automatic request validation (a malformed body is
+  rejected with a 422 before your endpoint code even runs), automatic
+  response serialization, AND automatic OpenAPI/Swagger docs generation —
+  you get `/docs` for free from the same type annotations you'd write
+  anyway.
+
+  MIDDLEWARE — code that wraps EVERY request, regardless of which endpoint
+  matches. This project registers exactly one, `CORSMiddleware` (`app/
+  main.py`):
+
+      app.add_middleware(
+          CORSMiddleware,
+          allow_origins=get_settings().cors_origins,
+          allow_credentials=False,
+          allow_methods=["*"],
+          allow_headers=["*"],
+      )
+
+  CORS (Cross-Origin Resource Sharing) is a BROWSER-enforced security rule:
+  a page served from origin A (e.g. the Vite dev server on
+  `localhost:5173`) is blocked by the browser itself from reading a
+  response from origin B (this backend) unless B's response explicitly
+  says "origin A is allowed." `CORS_ORIGINS` in `.env` is that allow-list —
+  get it wrong and you'll see a browser-side network error that LOOKS like
+  the backend is broken even though it answered fine; the design doc calls
+  this out explicitly as a real deployment gotcha (section 14).
+
+  EXCEPTION HANDLERS — `@app.exception_handler(Exception)` in `main.py`
+  catches anything that would otherwise become a raw 500 with a Python
+  traceback in the response body, logs the real traceback server-side, and
+  returns a generic `{"detail": "An unexpected error occurred."}` instead —
+  because a raw traceback can leak file paths, query fragments, or library
+  internals to an external caller, unacceptable for a platform aimed at
+  regulated enterprises.
+
+  HEALTH VS READINESS — `main.py` exposes both `/healthz` (is the process
+  alive at all — checks nothing external) and `/readyz` (can it actually
+  serve real traffic — checks that Postgres answers `SELECT 1`). This is a
+  standard pattern in container orchestration: a liveness-probe failure
+  should RESTART the process, a readiness-probe failure should just stop
+  ROUTING traffic to it (e.g. during a slow DB reconnect) — conflating the
+  two would restart a perfectly healthy process just because its database
+  had a momentary blip.
+
+--------------------------------------------------------------------------------
+2.4 SQLALCHEMY 2.0 (ASYNC) + ALEMBIC, IN DEPTH
+--------------------------------------------------------------------------------
+
+SQLALCHEMY is Python's most widely used ORM (Object-Relational Mapper) — it
+lets you describe database tables as Python classes and query them with
+Python expressions instead of hand-written SQL strings. Version 2.0
+introduced a cleaner, more explicit query style (`select(Model).where(...)`)
+and first-class ASYNC support, which is what this project uses throughout
+(`sqlalchemy>=2.0.0` + `asyncpg>=0.29.0` in `pyproject.toml`).
+
+  MODELS — a plain Python class mapped to a table, e.g. (paraphrasing the
+  real shape from `backend/app/models/agents.py`, following the pattern
+  seen across `models/*.py`):
+
+      class Agent(Base):
+          __tablename__ = "agents"
+          __table_args__ = {"schema": "agent_forge"}
+          id: Mapped[uuid.UUID] = mapped_column(primary_key=True, ...)
+          name: Mapped[str] = mapped_column(...)
+          model_config_json: Mapped[dict] = mapped_column("model_config", JSONB)
+          ...
+
+  Every table in this project's Postgres schema lives under the SCHEMA
+  namespace `agent_forge` (not the default `public` schema) — this is how
+  the platform's own config tables can coexist inside the SAME physical
+  Postgres server/database as an unrelated pre-existing `studybuddy`
+  database without colliding (see the README: "Postgres schema (agent_forge
+  schema inside the existing studybuddy DB)").
+
+  ASYNC SESSIONS — a `Session` (sync SQLAlchemy) becomes an `AsyncSession`
+  here; every DB operation is `await`ed:
+
+      async with async_session_factory() as session:
+          result = await session.execute(select(Agent).where(Agent.name == "x"))
+          agent = result.scalar_one_or_none()
+
+  `select(...)` builds a query object without running it; `.execute(...)`
+  actually runs it and returns a `Result` you then pull rows out of via
+  `.scalars().all()` (a list of ORM objects), `.scalar_one_or_none()` (zero
+  or one row), etc. `session.add(obj)` stages an insert; `await session.
+  commit()` actually writes it; `await session.flush()` pushes pending
+  changes to the DB WITHOUT committing yet — useful when a later statement
+  in the same transaction needs an autogenerated id (e.g. a UUID default)
+  from an object you just added but haven't committed.
+
+  RELATIONSHIPS / JOINS — this project favors explicit `.join(...)` over
+  ORM-magic `relationship()` attributes in most of its query code (you can
+  see this directly in `builder.py`'s `_load_live_tools`):
+
+      select(Tool)
+        .join(AgentTool, AgentTool.tool_id == Tool.id)
+        .where(AgentTool.agent_id == agent_id, Tool.workspace_id == workspace_id)
+
+  — a plain join table (`agent_tools`, with a composite primary key of
+  `(agent_id, tool_id)`) is how a many-to-many "this agent has these tools
+  attached" relationship is modeled, the same pattern used for
+  `agent_skills` and `agent_subagents`.
+
+  ALEMBIC is SQLAlchemy's companion migration tool: instead of manually
+  running `ALTER TABLE` on every environment (local, staging, production)
+  by hand, you write (or auto-generate) a small Python "migration" file
+  describing `upgrade()` (apply this change) and `downgrade()` (undo it),
+  and Alembic tracks which migrations have already been applied via its own
+  bookkeeping table. This project has 24 migration files in `backend/
+  alembic/versions/`, each named `<random-hex>_<short-description>.py`,
+  forming a linked list via `revision`/`down_revision` fields — e.g. the
+  very first one:
+
+      revision = '9e65c5d7c0cd'
+      down_revision = None       # the very first migration has no parent
+
+      def upgrade() -> None:
+          op.create_table('agents', ...)
+
+  Running `alembic upgrade head` walks forward from whatever revision the
+  target database is CURRENTLY at, applying every migration in order, up to
+  the newest ("head"). This project's `docker-entrypoint.sh` runs exactly
+  this command on every single container boot — meaning a schema change
+  shipped in code auto-applies to the real database the moment a new
+  container starts, before the app even begins accepting traffic. This is
+  why, when you pushed code containing a new migration file earlier in this
+  session, the production database's schema updated itself the moment
+  Railway redeployed — no manual step was needed for that PART of the
+  change (only the manual DATA-migration scripts needed a deliberate,
+  separate run).
+
+--------------------------------------------------------------------------------
+2.5 POSTGRESQL + PGVECTOR, IN DEPTH
+--------------------------------------------------------------------------------
+
+Postgres is the relational database holding every config table this
+platform owns. On top of plain relational storage, this project requires
+the `pgvector` EXTENSION (`CREATE EXTENSION vector`) — note `docker-
+compose.yml` deliberately uses the `pgvector/pgvector:pg16` image, not
+stock `postgres:16`, specifically because this extension isn't bundled with
+vanilla Postgres.
+
+  WHAT AN EMBEDDING IS — a piece of text (a question, a sentence) can be
+  converted by a separate small ML model into a fixed-length list of
+  floating-point numbers (a "vector") such that texts with SIMILAR MEANING
+  end up as vectors that are CLOSE TOGETHER in that many-dimensional space,
+  even if they don't share any of the same words. "What's Tesla's exposure?"
+  and "How much is Tesla's facility utilization?" might end up close
+  together; "What's the weather in Paris?" would end up far away. This
+  project uses one fixed embedding model everywhere embeddings are needed —
+  a local `sentence-transformers` model, `all-MiniLM-L6-v2`, producing
+  384-dimensional vectors (see `app/embeddings.py`) — "local" meaning it
+  runs on the backend's own CPU, no external embedding API call/cost.
+
+  WHAT PGVECTOR ADDS — a new Postgres column TYPE (`vector(384)`) plus new
+  SQL operators for computing distance/similarity between two vectors
+  directly in a query (e.g. cosine distance), and index types
+  (IVFFlat/HNSW) that make "find the N most similar rows to this vector"
+  fast even over large tables, instead of a full-table scan computing
+  distance against every row.
+
+  WHERE THIS PROJECT USES IT:
+    - SCIL's semantic response cache (`scil_semantic_cache`) — embed an
+      incoming question, look for a past validated answer to a
+      COSINE-SIMILAR question (not just an identical one), return it with
+      zero new LLM calls if similarity clears a threshold (default 0.80).
+    - SCIL's correction-exemplar injection — find past mistakes similar to
+      the CURRENT input before the model even attempts it, so a known
+      mistake for a similar question gets pre-empted.
+    - `retrieval_tool` — classic RAG (Retrieval-Augmented Generation):
+      chunks of a knowledge base are embedded once and stored; at query
+      time, the user's question is embedded and the most similar chunks are
+      pulled back as extra context for the model, so it can ground its
+      answer in real reference material it wasn't trained on.
+
+--------------------------------------------------------------------------------
+2.6 MYSQL ALONGSIDE POSTGRES — WHY TWO DATABASES
+--------------------------------------------------------------------------------
+
+This is a genuinely deliberate architectural choice, not incidental: Postgres
+holds the platform's OWN configuration and audit history (agents, tools,
+users, SCIL memory) — the CONTROL PLANE. MySQL holds actual DOMAIN business
+data — credit facility numbers, revenue/returns figures, sales orders — the
+DATA PLANE. Keeping them on physically separate servers/engines (even though
+either engine could technically hold both) enforces a clean mental and
+operational boundary: wiping/restoring the platform's own config can never
+accidentally touch a customer's real business data, and vice versa. Several
+MySQL "connections" (`CREDIT_FACILITY_MYSQL_*`, `REVENUE_RETURNS_MYSQL_*`,
+`SALES_DB_*` in `.env`) can point at the same physical MySQL server with
+different database names/table prefixes (`cf_*`, `rr_*`, `sales_analytics`
+schema) — see `pymysql`+`DBUtils` in `pyproject.toml` for the connection-
+pooling library used to talk to it.
+
+--------------------------------------------------------------------------------
+2.7 MCP — THE MODEL CONTEXT PROTOCOL
+--------------------------------------------------------------------------------
+
+MCP is an open protocol (originated at Anthropic, now broadly adopted) for
+exposing a set of "tools" (and optionally resources/prompts) over a
+standard interface, independent of which AI framework or model is calling
+them. Instead of writing framework-specific tool-wrapping code for every
+different agent framework you might use, you write ONE MCP server, and any
+MCP-COMPATIBLE client (ADK, Claude Desktop, other agent frameworks) can talk
+to it identically.
+
+  TRANSPORT — an MCP server can be reached over stdio (the client launches
+  it as a local subprocess and talks over its stdin/stdout — used here for
+  every server in `backend/mcp_servers/`) or over HTTP (a remote server,
+  also supported by ADK's tool but not what this project's own servers use).
+
+  THE PROTOCOL, CONCEPTUALLY — the client asks the server "what tools do
+  you have" (server replies with names + JSON schemas), then later says
+  "call tool X with these arguments" (server executes it and replies with a
+  result) — structurally identical to a normal in-process tool call, just
+  over a process/network boundary instead of a plain function call.
+
+  ADK'S CLIENT SIDE — `McpToolset` (see 2.2's version-pin discussion) is
+  ADK's `BaseToolset` implementation that speaks this protocol: it launches/
+  connects to a server, discovers its tools, and exposes them to an
+  `AdkAgent` exactly like any other tool. This project's `app/tool_registry/
+  mcp_tool.py` builds one of these per `mcp_tool`-typed row, configured with
+  either `command`/`args` (spawn a local stdio subprocess — this project's
+  own `mcp_servers/*.py` scripts) or a remote HTTP URL.
+
+--------------------------------------------------------------------------------
+2.8 REACT + TYPESCRIPT + VITE + TAILWIND CSS, IN DEPTH
+--------------------------------------------------------------------------------
+
+REACT is a UI library where you describe your interface as a tree of
+declarative, reusable COMPONENTS (plain functions that return "what should
+be on screen given these inputs") and React itself figures out the minimal
+set of real DOM changes needed whenever your data changes, rather than you
+manually mutating the DOM. This project uses React 18 with the newer
+`react-dom@19`-family APIs and function components + HOOKS exclusively (no
+class components) — `useState` (local component state), `useEffect`
+(run code in response to a render/mount/dependency change), and so on.
+
+TYPESCRIPT is JavaScript with a static type system layered on top, checked
+at compile time (`tsc`) rather than only failing at runtime. Every `.tsx`
+file in `frontend/src` is TypeScript; `interface`/`type` declarations (see
+`frontend/src/api/types.ts`) describe exactly what shape a backend response
+has, so a typo in a field name is a compile error, not a silent `undefined`
+bug discovered by a user.
+
+VITE is the build tool/dev server. Compared to older tools (Create React
+App, Webpack directly), Vite's headline feature is near-instant dev-server
+startup and hot-module-reload, because during development it serves your
+source files to the browser as native ES modules and only transforms
+what's actually requested, instead of bundling your entire app up front.
+`npm run dev` starts this dev server; `npm run build` (`tsc -b && vite
+build`) type-checks the whole project then produces an optimized static
+bundle for production, which is what `frontend/Dockerfile` (via Caddy,
+see 3.15) actually serves in a real deployment.
+
+TAILWIND CSS is a "utility-first" CSS framework: instead of writing custom
+CSS classes (`.card { padding: 1rem; ...}`) you compose small, single-
+purpose utility classes directly in your markup (`className="flex items-
+center gap-2 rounded-md px-3 py-1.5"` — a real line straight out of `Layout.
+tsx`). This project pulls Tailwind in via its Vite plugin (`@tailwindcss/
+vite` in `package.json`) — no separate CSS build step to configure. Classes
+like `dark:text-slate-300` are Tailwind's built-in dark-mode variant
+mechanism, toggled by a `dark` class/attribute Tailwind looks for higher up
+the DOM tree (this project's `ThemeToggle`/`lib/theme.tsx` manage that).
+
+COMPONENT ORGANIZATION IN THIS REPO — `frontend/src/`:
+    pages/        — one file per ROUTE (`AgentsPage.tsx`, `ChatPage.tsx`,
+                    `ReliabilityDashboardPage.tsx`, ...) — the top-level
+                    screen for a URL.
+    components/   — reusable pieces, further split by feature area
+                    (`components/agents/`, `components/tools/`,
+                    `components/scil/`, ...) plus a `components/ui/`
+                    folder of generic, feature-agnostic primitives (Button,
+                    Card, Modal, Badge, Toggle, StatTile, ...) every page/
+                    feature composes from.
+    api/          — one file per backend RESOURCE (`api/agents.ts`, `api/
+                    tools.ts`, `api/reliability.ts`, ...), each wrapping
+                    TanStack Query hooks (2.9) around plain `fetch` calls.
+    lib/          — small, framework-agnostic helper modules (auth token
+                    storage, theme state, chart color palettes, ...).
+
+--------------------------------------------------------------------------------
+2.9 TANSTACK QUERY (REACT QUERY), IN DEPTH
+--------------------------------------------------------------------------------
+
+Once a frontend talks to a backend API, you need to answer: where is the
+"server state" (data that actually lives on the server, and might be stale)
+cached, when does it get re-fetched, and how do you avoid every component
+that needs it re-fetching independently? TanStack Query answers all of this
+generically, so you don't hand-roll it per feature.
+
+  `useQuery({ queryKey, queryFn })` — declares "this component needs data
+  identified by `queryKey`, fetched by calling `queryFn`." TanStack Query
+  caches the result BY that key; two components asking for the same key get
+  the same cached data without two network calls, and it handles
+  loading/error states, background refetching, and staleness for you. A
+  real example, `frontend/src/api/agents.ts`:
+
+      const KEY = ['agents'] as const
+      export function useAgents() {
+        return useQuery({ queryKey: KEY, queryFn: () => api.get<Agent[]>('/agents') })
+      }
+
+  `useMutation({ mutationFn, onSuccess })` — declares a WRITE operation
+  (POST/PATCH/DELETE). On success, you typically call `queryClient.
+  invalidateQueries({ queryKey })` to mark cached data under that key as
+  stale, which triggers TanStack Query to automatically refetch it — this
+  is how "publish an agent" (a mutation) causes the agent list (a query)
+  to visibly update everywhere it's shown, without manually passing
+  callbacks between unrelated components:
+
+      export function usePublishAgent(id: string) {
+        const qc = useQueryClient()
+        return useMutation({
+          mutationFn: (published_by?: string) => api.post(`/agents/${id}/publish`, { published_by }),
+          onSuccess: () => {
+            qc.invalidateQueries({ queryKey: agentKey(id) })
+            qc.invalidateQueries({ queryKey: KEY })
+          },
+        })
+      }
+
+  `enabled: false` — a query can be told not to run at all (e.g. `enabled:
+  !!id`, only fetch once an id actually exists — see `useAgent` above) or,
+  as the design doc notes, a role-gated dashboard passes `enabled: false`
+  for an endpoint a `developer` role isn't allowed to call, so the request
+  is never even attempted rather than failing with a 403 the UI has to
+  swallow.
+
+  ONE `QueryClient` for the whole app is created once (`App.tsx`'s
+  `const queryClient = new QueryClient()`) and provided via
+  `<QueryClientProvider client={queryClient}>` wrapping everything — this
+  is the single shared cache every `useQuery`/`useMutation` call reads
+  from/writes to.
+
+--------------------------------------------------------------------------------
+2.10 REACT ROUTER, IN DEPTH
+--------------------------------------------------------------------------------
+
+A single-page app (SPA) doesn't reload the whole page on navigation — React
+Router intercepts URL changes and swaps which React components render,
+client-side. `BrowserRouter` (App.tsx) enables this using the browser's
+real History API (so back/forward/bookmarking still work normally).
+`<Routes>`/`<Route path="..." element={...}>` map a URL pattern to a
+component. `<Route element={<Layout />}>` wrapping a group of child
+`<Route>`s (as seen in `App.tsx`'s `AdminApp`) means every one of those
+children renders INSIDE `Layout`'s `<Outlet />` — this is how the sidebar/
+top-bar chrome stays constant while only the inner page content swaps.
+
+This project layers its OWN authorization on top, purely client-side (the
+real enforcement is server-side, per 2.3's `require_role`):
+
+    function RequireRole({ roles, children }) {
+      const role = getStoredRole()
+      if (!roles.includes(role)) return <Navigate to="/" replace />
+      return <>{children}</>
+    }
+
+  — wrapping a route's element in `<RequireRole roles={['admin']}>` bounces
+  a non-admin back to `/` before the page even renders, purely as a UX nicety
+  (so a `viewer` doesn't see a page that would fail every request it makes) —
+  never treated as the actual security boundary.
+
+--------------------------------------------------------------------------------
+2.11 DOCKER + RAILWAY, IN DEPTH
+--------------------------------------------------------------------------------
+
+DOCKER packages an application plus everything it needs to run (system
+libraries, the Python/Node runtime, dependencies) into an immutable image,
+built from a `Dockerfile` — a script of steps ("start from this base image,
+copy these files, run this install command, expose this port, run this
+command on start"). This project has one `Dockerfile` per service
+(`backend/Dockerfile`, `frontend/Dockerfile`). The backend one:
+
+    FROM python:3.12-slim
+    WORKDIR /app
+    COPY pyproject.toml ./
+    RUN pip install --no-cache-dir .
+    COPY . .
+    ENTRYPOINT ["/app/docker-entrypoint.sh"]
+
+  — deliberately copies just `pyproject.toml` and installs dependencies
+  BEFORE copying the rest of the source code, so Docker's build-layer cache
+  can reuse the (slow) dependency-install step across rebuilds that only
+  change application code, not dependencies.
+
+  `docker-entrypoint.sh` is the actual startup command:
+
+    alembic upgrade head
+    exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}"
+
+  — meaning EVERY container boot first brings the database schema up to
+  date, then starts serving. `${PORT:-8000}` is shell syntax for "use the
+  environment variable PORT if set, otherwise default to 8000" — needed
+  because hosting platforms like Railway assign a dynamic port at runtime
+  via that env var, whereas local development has no such variable set.
+
+  DOCKER COMPOSE (`docker-compose.yml`, root of the repo) describes MULTIPLE
+  containers that work together for LOCAL development parity — Postgres
+  (the `pgvector/pgvector` image specifically, see 2.5), MySQL, the backend,
+  the frontend, an optional Jaeger tracing backend, and an optional MongoDB.
+  `docker compose up -d postgres mysql` starts just the two databases (so
+  you can run the backend directly on your host machine against them);
+  `docker compose up --build backend frontend` builds and runs the full
+  containerized stack. This file explicitly is NOT what production uses —
+  its own top comment says so — it exists purely so a fresh checkout can
+  spin up the whole system with one command without installing Postgres/
+  MySQL by hand.
+
+  RAILWAY is a hosting platform (this project's actual, documented,
+  tested host — see the earlier conversation's live verification against
+  project "lavish-inspiration"). It runs each Dockerfile-based service as
+  a "service," offers managed Postgres/MySQL "plugins" (so you don't run
+  your own database server), and injects environment variables (including
+  `PORT`, and whatever you configure in its dashboard) into each service's
+  container. Pushing to the connected GitHub branch (`main`, in this
+  project's case) triggers an automatic rebuild-and-redeploy — which is
+  exactly what you watched happen earlier: the moment the durable-execution
+  commit was pushed, Railway rebuilt the `agent_forge` service's image and
+  restarted it, and `docker-entrypoint.sh`'s `alembic upgrade head` applied
+  the new migration automatically as part of that restart. `railway run
+  --service <name> -- <command>` executes a command LOCALLY but with that
+  service's real environment variables (including its real, remote
+  `DATABASE_URL`) injected — this is how a one-off script (a data
+  migration, a seed script) gets run against a HOSTED database without
+  needing a shell literally inside the Railway container.
+
+--------------------------------------------------------------------------------
+2.12 OPENTELEMETRY + JAEGER, IN DEPTH
+--------------------------------------------------------------------------------
+
+OpenTelemetry (OTel) is a vendor-neutral standard for emitting "traces" —
+a tree of timed "spans" describing what a request/process actually did and
+how long each part took (e.g. one root span for "handle this chat turn,"
+with child spans for "call tool X," "call tool Y"). Because it's an open
+STANDARD (the "OTLP" wire protocol), any OTLP-compatible backend (Jaeger,
+Grafana Tempo, Honeycomb, Datadog, Langfuse) can receive the same spans —
+switching backends is a config change (`OTEL_EXPORTER_OTLP_ENDPOINT`), not
+a code change. This project's backend optionally exports spans this way
+(`otel_enabled` in `config.py`, off by default so a fresh checkout doesn't
+need a trace backend running just to boot) via the `opentelemetry-*`
+packages in `pyproject.toml`. Jaeger is one specific, popular OTLP-
+compatible backend with its own UI for browsing traces — `docker-compose.
+yml`'s `jaeger` service brings up a local one in one command, exposing an
+OTLP gRPC receiver on `4317` and a UI/query API on `16686`. This project's
+own "Debug Console" (frontend page `/debug`) can reconstruct a similar
+waterfall view directly from its own `invocation_log`/`tool_call_log`
+tables even WITHOUT a real OTel backend configured — real OTel export adds
+true span-level timing and an "open in Jaeger" deep link on top of that
+baseline, but isn't required for the Debug Console to work at all.
+
+================================================================================
+PART 3 — THIS PROJECT'S ARCHITECTURE
+================================================================================
+
+--------------------------------------------------------------------------------
+3.1 SYSTEM ARCHITECTURE AND ONE REQUEST'S FULL JOURNEY
+--------------------------------------------------------------------------------
+
+Two independently deployable services, two databases:
+
+  BACKEND  (Python 3.12, FastAPI, Google ADK 2.4.0) — all business logic:
+           agent config CRUD, the ADK agent-building/caching layer, tool
+           execution, SCIL, durable execution, dashboards, auth. Talks to
+           Postgres (its OWN config/audit/SCIL schema, `agent_forge`) and
+           MySQL (domain business data). Spawns MCP server subprocesses on
+           demand for `mcp_tool`-typed tools.
+
+  FRONTEND (React 19 + TypeScript + Vite + Tailwind 4) — two surfaces
+           sharing one codebase: a role-gated ADMIN SHELL (agent building,
+           tool/skill libraries, dashboards, user management) and a
+           separate white-labeled END-USER CHAT surface (`/chat`) with its
+           own register/login flow. Talks to the backend ONLY over `/api/*`
+           REST — never touches either database directly.
+
+  POSTGRES — schema `agent_forge`. Requires the `pgvector` extension.
+  MYSQL    — domain business data, never the platform's own config.
+
+ONE CHAT/PLAYGROUND/INVOKE TURN, STEP BY STEP (tying every earlier concept
+together):
+
+  1. A caller hits one of three HTTP entry points — `POST /api/chat/message`
+     (or its streaming twin `/api/chat/message/stream`), `POST /api/
+     playground/run`, or `POST /api/agents/{id}/invoke` — all three funnel
+     through the SAME core logic, `_run_turn`/`_stream_turn` in
+     `playground_api/router.py` (2.3's "one router, many endpoints"
+     pattern, just reused across three different router files).
+
+  2. `agent_runtime.builder.get_or_build_agent(db, agent_id, version, ...)`
+     (2.2 + 3.4) returns a real `google.adk.agents.Agent` TREE — either
+     freshly built from the live DRAFT tables (Playground path — always
+     fresh, never cached, so edits are visible immediately) or from a
+     cached, FROZEN `agent_versions.snapshot` (published agents — the
+     cache, 3.4's `agent_cache`, is invalidated on publish).
+
+  3. SCIL (3.9) wraps the turn: check a deterministic template match, else
+     check the semantic cache (2.5's pgvector similarity search), else make
+     a REAL ADK `Runner.run_async()` call (2.2), then validate the result
+     and self-correct-and-retry if a configured validator fails, then write
+     cache/correction/metrics rows.
+
+  4. Every tool call inside that `Runner.run_async()` call passes through
+     ONE SHARED `before_tool_callback` (3.4) that: caps agent-to-agent
+     hand-offs per turn (3.5's hard safety net), injects trusted identity
+     into row-level-security-scoped tools, enforces the matching
+     `access_policy`'s scope predicate, and (for durable-execution-enabled
+     agents) checks whether this EXACT tool call was already durably
+     recorded by a prior crashed attempt of this same turn (3.10).
+
+  5. `invocation_log`/`tool_call_log` rows are written (mostly fire-and-
+     forget, i.e. `asyncio.create_task(...)` without awaiting completion,
+     so writing them never adds latency to the user-visible response) for
+     observability/usage/audit dashboards.
+
+--------------------------------------------------------------------------------
+3.2 DATA MODEL / DATABASE SCHEMA
+--------------------------------------------------------------------------------
+
+All of the following live in Postgres schema `agent_forge` (see 2.4 for what
+a "schema" means here) unless noted as MySQL.
+
+  CORE CONFIG
+    workspaces        — the multi-tenancy boundary (currently, in practice,
+                        everything uses one `DEFAULT_WORKSPACE_ID` — full
+                        multi-tenancy hardening is an explicit backlog item).
+    users             — id, email, password_hash, role (admin/viewer/
+                        chat_user/developer), workspace_id, status (pending/
+                        approved/rejected), soeid (an OPTIONAL corporate
+                        identity string, distinct from this account's own id
+                        — lets a row-level-security policy match against a
+                        real-world corporate identity instead of this app's
+                        own opaque user id, for domains whose underlying
+                        data is keyed that way).
+    agents            — id, name, description, base_instruction, model_
+                        config (JSONB — model string, temperature, and
+                        optional `scil`/`durable_execution`/`planning`
+                        sub-objects, each independently opt-in), status
+                        (draft/published/archived), current_version,
+                        created_by.
+    agent_versions    — one row per PUBLISHED version; `snapshot` is a
+                        fully self-contained JSONB blob (name, description,
+                        instruction, model_config, tool/skill/sub-agent ids)
+                        — this is EXACTLY what `_build_from_snapshot` (3.4)
+                        builds from, frozen at publish time.
+    agent_tools, agent_skills, agent_subagents
+                      — plain many-to-many join tables (2.4), CASCADE-
+                        deleted alongside either side.
+    agent_publish_requests
+                      — a DEVELOPER's publish attempt freezes the current
+                        config into `snapshot` here (status=pending)
+                        instead of going live immediately — an admin later
+                        approves/rejects (3.12).
+    agent_collaborators, skill_collaborators
+                      — author-managed edit-access sharing (3.3): the
+                        resource's own creator can grant ONE specific other
+                        developer edit rights without transferring
+                        ownership.
+    tools             — id, name, tool_type, config (JSONB, shape is
+                        tool_type-specific — see 3.7), input_schema,
+                        workspace_id.
+    skills            — id, name, instruction_text, few_shot_examples
+                        (JSONB), tags. A "skill" is reusable INSTRUCTION
+                        TEXT (plus optional examples) attached to one or
+                        more agents, concatenated onto that agent's
+                        `base_instruction` at build time (see `compose_
+                        instruction` in `builder.py`, 3.4) — NOT a tool,
+                        just prompt content you can compose/reuse across
+                        agents without copy-pasting text.
+    access_policies    — id, resolver_config (which identity key a policy
+                        matches against — a user's own id, or their soeid),
+                        rules (JSONB — persona -> scope-predicate mapping).
+    data_entities      — a table/collection's data dictionary: columns,
+                        labels, format hints, tagged as search/filter/
+                        measure — introspected once from a real
+                        MySQL/Mongo connection, editable after.
+
+  OBSERVABILITY / AUDIT
+    invocation_log    — one row per agent TURN (agent_id, invoked_by,
+                        status, tokens, estimated_cost_usd, latency, plus
+                        the durable-execution fields added this session —
+                        `adk_invocation_id`, a resumable `status='running'`
+                        state).
+    tool_call_log     — one row per TOOL CALL within a turn (tool_id,
+                        invocation_id FK, input/output, idempotency_key,
+                        call_index, compensation_status).
+    config_audit_log  — HASH-CHAINED: each row's own hash is computed
+                        INCLUDING the previous row's hash (see `app/
+                        audit_hash.py`), so silently editing or deleting an
+                        old row breaks the chain for every row after it —
+                        a config change history that is tamper-evident, not
+                        just tamper-logged.
+
+  SCIL (2.5's pgvector-backed pieces; full behavior in 3.9)
+    scil_semantic_cache, scil_correction_memory, scil_entity_memory,
+    scil_eval_cases, scil_eval_runs, scil_groundedness_samples, scil_metrics.
+
+  RELIABILITY (added this session — 3.10)
+    ReliabilityDemoInventory (a tiny demo table for the compensation
+    worked example) plus new columns on `invocation_log`/`tool_call_log`
+    for durable checkpointing (see the `7b2e4f91a3c8_add_durable_
+    execution_columns` migration you already applied to both local and
+    production).
+
+  DOMAIN DATA (MySQL, deliberately NEVER Postgres — see 2.6)
+    cf_company_master, cf_company_facility_monthly, cf_user_persona,
+    cf_user_company_coverage (Credit Facility); rr_product_master,
+    rr_revenue_returns_monthly (Revenue & Returns); the `sales_analytics`
+    schema (Sales Analytics demo domain).
+
+--------------------------------------------------------------------------------
+3.3 ROLES, PERMISSIONS, AND OWNERSHIP
+--------------------------------------------------------------------------------
+
+Four roles, enforced through ONE dependency (`require_role(...)` in
+`app/principal.py` — 2.3's dependency-injection pattern), never re-
+implemented ad hoc per endpoint:
+
+  admin      — full access to everything: config, tools, dashboards, SCIL
+               curation, user management, direct publish, rollback.
+  developer  — builds/tests agents in the SAME Agent Builder + Playground
+               as admin, gets chat access, but:
+                 * can only MODIFY an agent/skill they created, unless its
+                   creator explicitly added them as a COLLABORATOR (see
+                   below).
+                 * publishing NEVER goes live immediately — it freezes a
+                   snapshot into `agent_publish_requests` for an admin to
+                   approve (3.12).
+                 * can list/view every tool in the workspace, but not
+                   create/edit/delete one.
+                 * in Playground, must supply their OWN Gemini/Anthropic
+                   API key (no operator-key fallback) — see BYOK, 3.14.
+                 * sees SCIL eval-suite results only for agents they
+                   created/collaborate on; sees the usage/cost dashboard
+                   scoped to only their own agents.
+                 * cannot: rollback a published version, see SCIL cache/
+                   correction/entity curation, manage users, see audit-log/
+                   monitoring dashboards, hit `/invoke` (admin-only,
+                   machine-to-machine).
+  viewer     — read-only across dashboards/config; cannot build or test.
+  chat_user  — public/end-user chat access only; no admin-shell access.
+
+  OWNERSHIP + COLLABORATOR SHARING — the base rule is "a developer can only
+  modify what they created." On top, a resource's own CREATOR (or an admin)
+  can grant a SPECIFIC other developer edit access without transferring
+  ownership (`POST /agents/{id}/collaborators`) — critically, managing WHO
+  is on that list is the creator's call alone: a collaborator granted
+  access cannot themselves add a third party (a separate `_require_is_
+  owner` check, distinct from the general `_require_can_modify` check).
+
+  STATIC ADMIN TOKEN — `AGENT_FORGE_API_TOKEN` (an env var) is a
+  break-glass credential, not a per-user account: it always resolves to
+  `role=admin` in the default workspace. Used for the admin-password login
+  tab and for scripts/tests (you used this implicitly every time a script
+  ran against a database directly, bypassing HTTP auth entirely by talking
+  to the DB layer — scripts run with full DB access, no role check at all,
+  which is exactly why running one against a database, local OR
+  production, deserves the same care as an admin action would).
+
+--------------------------------------------------------------------------------
+3.4 AGENT RUNTIME — builder.py, ANNOTATED
+--------------------------------------------------------------------------------
+File: `backend/app/agent_runtime/builder.py`
+
+This is THE file where a Postgres row becomes a real `google.adk.agents.
+Agent` object (2.2). Everything about "how ADK is actually used" in this
+project lives here.
+
+TWO BUILD PATHS
+  `_build_from_live_config` — always fresh, never cached. Recursively walks
+  `agents` -> its live `agent_tools`/`agent_skills`/`agent_subagents` rows,
+  builds every sub-agent the same way, and constructs a real `AdkAgent`.
+  Used by Playground, so an edit to a draft is visible on the very next
+  test run with no publish step.
+
+  `_build_from_snapshot` — builds from a FROZEN `agent_versions.snapshot`
+  row instead of the live tables, and the RESULT is cached in `agent_cache`
+  (`app/agent_runtime/cache.py`), keyed by `(agent_id, version)`. Used by
+  `/chat` and `/invoke` — the surfaces real users/systems hit, where you
+  want every request to reuse the same already-built agent tree instead of
+  re-querying and re-constructing it from scratch every single time.
+
+  Both re-verify, at EVERY recursion level, that a tool/skill/sub-agent
+  actually belongs to the SAME workspace as the root — defense in depth
+  beyond whatever check ran when the attachment was first created, so a
+  cross-tenant reference (a legacy NULL-workspace row, or a future bug
+  elsewhere) can never silently end up inside a built agent tree.
+
+MODEL RESOLUTION — `_resolve_model` (2.2's "model routing"):
+
+    def _resolve_model(model: str) -> str | LiteLlm:
+        if model.startswith("anthropic/"):
+            return LiteLlm(model=model, llm_client=ContextAwareLiteLLMClient())
+        return model
+
+  A bare Gemini string passes straight through — ADK resolves it at call
+  time to `ContextualGemini`, a subclass registered for EVERY `gemini-*`
+  string at process startup (`byok.register()`, called from `app/main.py`
+  before the app even starts serving — see that file's comment on why this
+  must happen before any request, related to an `@lru_cache`'d resolver).
+  An `"anthropic/<model>"` string — what the Agent Builder's model dropdown
+  literally stores for every Claude option — gets wrapped in ADK's
+  `LiteLlm` adapter (2.2). The `ContextAwareLiteLLMClient` is this
+  project's own class that sources its API key from a per-request
+  `ContextVar` AT CALL TIME rather than one frozen when the LiteLlm
+  instance was constructed — necessary because this SAME cached instance
+  is reused across many different users/requests, each potentially
+  supplying their own BYOK key (3.14).
+
+THE SHARED before_tool_callback / after_tool_callback — `_build_before_
+tool_callback`/`_build_after_tool_callback`. ONE callback pair, registered
+on EVERY single agent this platform ever builds (not opt-in per agent for
+most of what it does), doing FOUR jobs:
+
+  (a) TRANSFER-HOP SAFETY NET — since `transfer_to_agent` is itself just
+      another `FunctionTool` (2.2), it flows through this exact same
+      callback. A per-turn counter (keyed by `tool_context.invocation_id`,
+      2.2 — unique per top-level turn, so no manual reset is ever needed)
+      caps hand-offs at 8; exceeding it returns an ERROR result (not an
+      exception) instructing the model to stop transferring and answer with
+      whatever it already has:
+
+        if tool.name == "transfer_to_agent":
+            state_key = f"_transfer_hops:{tool_context.invocation_id}"
+            hops = tool_context.state.get(state_key, 0) + 1
+            tool_context.state[state_key] = hops
+            if hops > _MAX_TRANSFERS_PER_TURN:
+                return {"error": "Too many agent hand-offs..."}
+
+      This is the HARD backstop behind the SOFT, prompt-level "never
+      transfer to the same specialist twice" instruction in 3.5 — a model
+      can ignore prompt text, it cannot ignore this.
+
+  (b) CONTEXT-PARAM INJECTION — a tool whose `config` lists entries under
+      `context_params` gets trusted, SERVER-VERIFIED session-state values
+      (e.g. the caller's own principal id) injected into its arguments
+      before it runs — the model is never trusted to pass these itself,
+      because a model can be prompt-injected into passing a WRONG identity
+      if it were ever asked to supply one.
+
+  (c) ROW-LEVEL SECURITY ENFORCEMENT — a tool whose `config` carries a
+      `policy_id` has that `AccessPolicy`'s scope predicate mechanically
+      applied (or the call denied outright, e.g. if no authenticated
+      identity exists on the session) BEFORE the tool's own logic ever
+      runs. This is the concrete answer to "how do you stop an LLM from
+      writing a SQL query that ignores row-level security" — you don't ask
+      the model nicely; you intercept every call at a layer it cannot see
+      or influence and rewrite/reject its arguments there.
+
+  (d) DURABLE-EXECUTION IDEMPOTENCY (before_tool) / DURABLE RECORDING
+      (after_tool) — see 3.10 in full; the short version is that a tool
+      call's real output is written synchronously to `tool_call_log` the
+      moment it succeeds (keyed by `f"{invocation_id}:{function_call_id}"`,
+      a key ADK itself assigns), and `before_tool` checks that same key
+      FIRST — if a prior, crashed attempt of this exact turn already
+      recorded a success for this exact call, the cached output is
+      returned WITHOUT re-executing the real tool at all.
+
+CACHING (`app/agent_runtime/cache.py`) — in-memory, keyed by `(agent_id,
+version)`; invalidated on publish AND on any structural change to an
+ANCESTOR (a sub-agent attach/detach, tool/skill attach/detach) — because a
+published agent's build is a FULLY MATERIALIZED tree (a parent's cached
+build has its children's tool lists baked in at build time, not re-derived
+live), a parent's stale cache entry would otherwise keep serving an outdated
+child indefinitely even after the child itself changed.
+
+MCP TOOLSET CLEANUP (`close_agent_toolsets`) — only matters for LIVE (never
+cached) builds: every `McpToolset` (2.7) owns a real subprocess, and a
+Playground run constructs a brand-new one on every single call. Without
+explicitly closing it after each turn, subprocesses leak — this was
+CONFIRMED live in this project's own history: 124 orphaned `mcp_servers/
+*.py` processes accumulated over one Playground testing session before this
+cleanup function existed.
+
+--------------------------------------------------------------------------------
+3.5 MULTI-AGENT ORCHESTRATION FRAMEWORK
+--------------------------------------------------------------------------------
+File: `backend/app/agent_runtime/orchestration_patterns.py`
+
+THE PROBLEM this solves: a single user question can legitimately need data
+from MORE than one domain specialist ("give me the credit facility exposure
+for Company X AND the return rate for Product Y"). A naive orchestrator
+prompt hardcoding "transfer to specialist A, then transfer to specialist B"
+only works for exactly two specialists and doesn't generalize.
+
+THE SOLUTION — no new orchestrator agent, no separate planning data
+structure. The coordination happens ENTIRELY through ADK's existing
+`transfer_to_agent` mechanism (2.2) plus two pieces of GENERIC, REUSABLE
+instruction text:
+
+  `build_router_instruction(domain_summary, specialists: dict[name, desc])`
+  generates a LOOP-UNTIL-COVERED algorithm (not "first/second" prose) as
+  the orchestrator's own system prompt:
+    1. Identify EVERY specialist domain the question touches.
+    2. Transfer to ONE relevant specialist not yet used for this question.
+    3. It answers what it can; if the question needs data outside its
+       domain, it silently transfers BACK to the orchestrator (never
+       sideways to another specialist) with a note on what's still
+       outstanding.
+    4. Repeat for whatever remains, picking the next relevant specialist —
+       identical whether it's the 2nd, 3rd, or Nth one needed.
+    5. Never transfer to the same specialist twice for one question.
+    6. Once nothing is outstanding, present ONE combined final answer,
+       attributing each figure to the specialist it came from.
+
+  Adding a NEW specialist is one new entry in the `specialists` dict passed
+  into this function — nothing about the generated instruction text
+  otherwise changes, regardless of how many specialists end up involved in
+  answering any given question. This is what makes the pattern GENERIC
+  (2.1's design principle) rather than a one-off hack for exactly two
+  agents.
+
+  `build_peer_clause()` / `strip_peer_clause(instruction)` — the matching
+  instruction snippet appended to EVERY specialist attached under such an
+  orchestrator: "silently bounce back to your parent for anything outside
+  your domain, never narrate the handoff to the user." Wrapped in an HTML-
+  comment marker (`<!-- router-peer-clause:start -->` ... `:end -->`), so a
+  later wording change can find-and-replace the OLD clause instead of
+  stacking a second copy alongside it — this is exactly why
+  `scripts/refresh_peer_clause.py` (which you ran against both local and
+  production databases earlier) exists as a SEPARATE script from
+  `consolidate_orchestrators.py`: the latter only appends the clause when
+  the marker is ENTIRELY ABSENT (a no-op once every specialist already has
+  SOME version of it), so bringing everyone up to a NEW wording after the
+  fact needs this dedicated re-application pass.
+
+THE HARD SAFETY NET — the "never transfer to the same specialist twice"
+rule above is a PROMPT-level instruction; a model can ignore it. The real
+backstop is 3.4's transfer-hop cap in `builder.py` — 8 hard-cutoff
+transfers per turn, applying automatically to EVERY agent this platform
+builds, not something a new orchestrator has to opt into.
+
+VERIFIED LIVE (a real Gemini call, not a mocked test): "Give me the credit
+facility exposure for Tesla Inc, and the return rate for Wireless Earbuds
+Pro" against `nl2sql_orchestrator` correctly transferred to BOTH
+`credit_facility_analyst` and `revenue_returns_analyst` in turn and combined
+both partial results into one final answer with clear per-domain
+attribution.
+
+--------------------------------------------------------------------------------
+3.6 PLANNER / REACT REASONING
+--------------------------------------------------------------------------------
+File: `backend/app/agent_runtime/planning_config.py`
+
+Per-agent opt-in, same shape as SCIL/durable-execution (`model_config.
+planning.enabled`), wired to ADK's `PlanReActPlanner` (2.2):
+
+    @dataclass
+    class PlanningConfig:
+        enabled: bool = False
+
+    def get_planning_config(agent_row) -> PlanningConfig:
+        raw = (agent_row.model_config_json or {}).get("planning") or {}
+        return PlanningConfig(enabled=bool(raw.get("enabled", False)))
+
+  `builder.py` passes `planner=PlanReActPlanner() if get_planning_config
+  (agent).enabled else None` into every `AdkAgent(...)` constructor — DECIDED
+  PER NODE from that agent's OWN config, unlike durable execution (which is
+  a property of the whole turn, inherited from the root). This means one
+  agent in a tree can have planning on while a sibling doesn't.
+
+  ADK marks the planner's reasoning/plan/action text as `part.thought =
+  True` on the response parts it produces; `playground_api/router.py`'s
+  turn-handling code splits on that flag so raw `/*PLANNING*/.../*ACTION*/
+  .../*FINAL_ANSWER*/` tags never leak into what the end user actually
+  sees, while STILL recording them as a `model_text` event (with `detail.
+  reasoning = true`) for the Debug Console.
+
+  Deliberately NOT enabled on agents whose `output_schema` requires strict
+  JSON output (`flashcard_agent`, `quiz_agent`) — `PlanReActPlanner` forces
+  free-text formatting, which cannot coexist with a schema-constrained
+  response — nor on `reliability_demo_agent` (a platform-capability demo,
+  out of scope).
+
+  HONEST CAVEAT (documented directly in this project's own history, not
+  glossed over): `PlanReActPlanner` is PURELY INSTRUCTIONAL — unlike
+  `BuiltInPlanner` (which activates a model's own native thinking-config
+  support), whether the model actually emits the tagged format at all is
+  model-compliance-dependent. On `gemini-3.5-flash`, in this project's own
+  live testing, the model did NOT reliably emit the tagged format — so the
+  wiring is correct and verified not to leak raw tags, but "planning" here
+  is not a guarantee the model will visibly show its reasoning, just an
+  opt-in instruction it MAY follow.
+
+--------------------------------------------------------------------------------
+3.7 TOOL REGISTRY — EVERY TOOL TYPE EXPLAINED
+--------------------------------------------------------------------------------
+Files: `backend/app/tool_registry/*.py`
+
+Every tool is one `tools` row (name, tool_type, config JSONB, input_schema
+JSON-schema). `app/tool_registry/factory.py`'s `build_tool(tool: Tool)` is
+a plain dispatch table — one `if tool.tool_type == "...":` branch per known
+type, each constructing the matching Python class. `app/tool_registry/
+base.py`'s `ConfigDrivenTool` (2.2) is the shared base every type extends —
+notice the factory NEVER `eval()`s or otherwise executes anything from the
+row itself; a `tool_type` string selects a FIXED, already-written Python
+class, and only that class's OWN config-shape (JSONB) is data-driven. This
+is a deliberate security boundary: a malicious or buggy `tools.config` value
+can misconfigure a fixed, already-audited code path, but it can never
+inject arbitrary new code.
+
+  http_tool           — an arbitrary REST call (base_url/method/path
+                        template from config). Fully generic, zero domain
+                        coupling.
+  mcp_tool            — binds to one MCP server (2.7/3.8), local (stdio
+                        subprocess) or remote (HTTP).
+  sql_tool            — a FIXED, hand-written SQL statement against one
+                        specific table (e.g. StudyBuddy's chapter-content
+                        lookup) — the model supplies parameters, never the
+                        SQL text itself.
+  db_schema_tool / nl2sql_query_tool
+                      — an older NL-to-SQL pair: exposes a schema
+                        description, lets the model write ARBITRARY SQL
+                        against it. Domain-bound (hand-wired per domain);
+                        superseded by `data_query_tool` for new domains.
+  data_query_tool     — THE generic, reusable NL2SQL primitive this
+                        platform is actually built around: schema
+                        description and access SCOPE both come from a
+                        `data_entities` row + optional `policy_id`, not
+                        hand-written Python. Every LLM-generated SQL string
+                        is parsed through a REAL `sqlglot` AST (not a regex)
+                        to enforce read-only, single-SELECT guardrails, and
+                        the matching access policy's row-filter predicate
+                        is AST-INJECTED directly into the parsed query
+                        before execution — this is what `credit_facility_
+                        analyst` and `revenue_returns_analyst` (3.11) are
+                        built on.
+  self_healing_sql_tool / read_scratchpad_tool
+                      — the "self-healing" pattern: a bad query NEVER
+                        raises an exception up to the model as a dead end —
+                        the real database/validation error is returned AS
+                        the tool's own result, so the model literally SEES
+                        the error text and can rewrite its own query on the
+                        next attempt (capped by a `max_retries` counter
+                        stored in `tool_context.state`, 2.2).
+                        `read_scratchpad_tool` lets a query-decomposition
+                        orchestrator read back a PRIOR sub-query's result
+                        from a named scratchpad slot — used by
+                        `revenue_query_orchestrator`'s "split a compound
+                        question into up to 3 independent sub-queries, run
+                        each, synthesize" pattern.
+  image_gen_tool      — Gemini image generation (a distinct model family,
+                        `gemini-2.5-flash-image`, unaffected by the
+                        text-model migration to `gemini-3.5-flash`).
+  retrieval_tool      — pgvector-backed RAG (2.5), shares the platform's
+                        one embedding model with SCIL's semantic cache.
+  mongo_query_tool / mysql_query_tool
+                      — the same generic "schema description + optional
+                        access-policy scope, LLM writes the query" idea as
+                        `data_query_tool`, targeting Mongo or a hand-picked
+                        MySQL connection respectively.
+  reservation_demo_tool
+                      — the reliability layer's OWN worked example (3.10):
+                        one class, three modes (`reserve`/`release`/
+                        `confirm`) against a tiny demo inventory table,
+                        purpose-built to prove saga/compensation actually
+                        fires, not just to be structurally wired up.
+
+--------------------------------------------------------------------------------
+3.8 MCP SERVERS IN THIS REPO
+--------------------------------------------------------------------------------
+Directory: `backend/mcp_servers/`
+
+Each file is a STANDALONE subprocess script (2.7) — notably, each loads its
+OWN `.env` directly rather than importing the `app` package (see `pyproject.
+toml`'s comment: only `app` is ever installed/imported as a package; these
+run as bare scripts spawned by `command`/`args` in a tool's config).
+
+  weather_server, mutual_fund_server, stocks_server, crypto_server,
+  forex_metals_server — each exposes a handful of tools calling a specific
+  free/no-key public data API (Yahoo Finance, CoinGecko, frankfurter.app,
+  gold-api.com, ...).
+  chart_server        — a GENERIC chart-PNG tool: any `{columns, data}`
+                        shape in, a chart image out — reused by three
+                        market-intelligence specialists AND
+                        `reporting_specialist` (2.1's "generic over
+                        one-off" principle, concretely).
+  slide_reporting_server — `chart_planner_tool` (pure pandas shape
+                        classification — no LLM call — decides WHAT chart
+                        type fits given data) + `slide_builder_tool`
+                        (renders a PPTX) + a domain-bound `nl_to_sql`/
+                        `sql_execution` pair specific to `sales_analytics`.
+  document_export_server — `export_to_pdf`/`export_to_excel`, fully
+                        generic. Every generated PDF/Excel/PPTX carries a
+                        shared "Agent Forge" diagonal watermark
+                        (`_watermark.py`) so a file forwarded off-platform
+                        stays traceable to its source.
+
+--------------------------------------------------------------------------------
+3.9 SCIL — SELF-CORRECTING INTELLIGENCE LAYER
+--------------------------------------------------------------------------------
+Directory: `backend/app/scil/`; the shared config dataclass lives in
+`app/scil/runner.py`'s `ScilConfig`/`get_scil_config`.
+
+A cost/latency-reduction layer wrapped around EVERY agent entry point,
+per-agent and OFF by default — an agent with no `model_config.scil` key
+behaves EXACTLY as if SCIL didn't exist. Five cooperating pieces:
+
+  1. TEMPLATE-BASED DETERMINISTIC ROUTING (`templates.py`) — checked FIRST,
+     because it's the cheapest possible check: per-agent regex/slot
+     templates in `model_config.scil.templates` answer a FULLMATCH (never a
+     substring of a longer question) with ZERO LLM calls at all
+     (`route = "deterministic"`).
+
+  2. SEMANTIC RESPONSE CACHE (`cache.py`, pgvector-backed, 2.5) — exact
+     sha256 match, else cosine similarity >= `cache_similarity_threshold`
+     (default 0.80) against a PAST VALIDATED answer, returned with zero new
+     LLM calls. RLS-scoped domains set `cache_scope: "user"` so a cached
+     answer is keyed by `(agent, user, question)` — one persona's answer
+     can never leak to a different user as a cache hit (verified live: the
+     same question from a different user_id is a guaranteed cache miss). A
+     turn with ANY failed tool call is never cached, so an "I encountered an
+     error" apology can never become a cache hit later.
+
+  3. CORRECTION-EXEMPLAR INJECTION (`exemplars.py`) — BEFORE an agent's
+     first attempt, its top-k most-similar PAST corrections (cosine >=
+     0.85) are prepended to the outbound prompt as a compact few-shot
+     block. Only the OUTBOUND PROMPT changes — the visible transcript,
+     cache key, and correction-memory writes all keep the ORIGINAL message.
+     This is "known mistakes get avoided up front," complementing #4's
+     "known mistakes get recovered from after the fact."
+
+  4. DETERMINISTIC VALIDATORS + SELF-CORRECTION (`validators.py`,
+     `corrector.py`) — configured validators (`sql` — a real `sqlglot` AST
+     check, read-only/single-SELECT guardrails; `json_schema` — the
+     agent's own declared `output_schema`) check every successful turn. On
+     failure, the SAME model is retried (up to `max_retries`, default 2)
+     with STRUCTURED error feedback, including a known-good fix from
+     correction memory if one exists for the same error class on a similar
+     input. A RECOVERED turn writes an `(input, mistake, fix)` row to
+     `scil_correction_memory` (feeding back into #3 for future turns); an
+     answer that never validates still reaches the user, but is NEVER
+     cached. Named error signatures: `SQL:Syntax`, `SQL:NotSingleSelect`,
+     `SQL:GuardrailViolation`, `JSON:ParseError`, `JSON:SchemaMismatch`.
+
+  5. HALLUCINATION / GROUNDEDNESS SAMPLING (`hallucination.py`) — a
+     configurable FRACTION of real successful turns (`eval_sample_rate`)
+     are scored, fire-and-forget, by an LLM judge against the tool-call
+     evidence actually returned in that turn — never blocks or retries the
+     live response, purely observational, written to `scil_groundedness_
+     samples`.
+
+  EVAL FRAMEWORK (`eval_runner.py` + `scil_eval_cases`/`scil_eval_runs`) —
+  a golden-question regression SUITE per agent (a real happy-path lookup, a
+  nonexistent-entity case that MUST refuse rather than fabricate, an
+  aggregation/comparison case, ...). `POST /scil/eval/run` runs every active
+  case for an agent's PUBLISHED version right now, grades each with an LLM
+  judge, groups results under one `batch_id` — this is how you get a
+  repeatable regression check for prompt/config changes, not just manual
+  spot-checking.
+
+  METRICS + ADMIN SURFACE — every turn writes ONE `scil_metrics` row
+  (`route` = disabled/deterministic/cache_hit/llm/llm_retry). The SCIL
+  Dashboard (`/scil`) shows LLM calls avoided, cache hit rate, retry
+  success rate, route distribution, savings over time, plus curation
+  tables. A `developer` sees only the Evals tab, scoped to agents they
+  created; Cache/Corrections/Overview metrics stay admin-only (3.3).
+
+  CONFIG SHAPE (per agent, `model_config.scil`):
+    { "enabled": true, "cache_similarity_threshold": 0.80,
+      "cache_ttl_hours": 24, "max_retries": 2, "validators": ["sql"],
+      "templates_enabled": true, "templates": [...],
+      "cache_scope": "user",   // RLS domains only
+      "eval_sample_rate": 0.0-1.0, "hallucination_groundedness_check": bool }
+
+  DELIBERATELY NOT ENABLED on the StudyBuddy agent family — its retrieval
+  is session-state-scoped in a way the "user" cache-scope dimension doesn't
+  fully capture, and quiz/flashcard output is SUPPOSED to vary run-to-run,
+  which caching would actively break.
+
+  NOT YET BUILT (an honest gap, not silently glossed over): escalation-tier
+  routing to a bigger model on repeated failure, and human-in-the-loop
+  (HITL) escalation.
+
+--------------------------------------------------------------------------------
+3.10 DURABLE EXECUTION & RELIABILITY LAYER
+--------------------------------------------------------------------------------
+Directory: `backend/app/reliability/`; config in `durable_execution_config.
+py` (same `{"enabled": true}` opt-in shape as SCIL/planning).
+
+WHAT PROBLEM THIS SOLVES, DISTINCT FROM SCIL — SCIL corrects wrong model
+CONTENT (bad SQL, malformed JSON). This layer handles INFRASTRUCTURE
+failures: the process crashes mid-turn, a downstream HTTP/DB call is flaky,
+or a multi-step turn partially completes before a later step fails. It
+builds on ADK's own `ResumabilityConfig` (2.2, marked `@experimental` in
+ADK 2.4.0) rather than inventing a whole new checkpoint engine — but ADK's
+own contract EXPLICITLY leaves a gap open ("tool call to resume needs to be
+idempotent because we only guarantee at-least-once behavior once resumed")
+— this project's own code exists specifically to close that gap and to make
+a crashed turn DISCOVERABLE, not just theoretically resumable.
+
+  EAGER, INCREMENTAL CHECKPOINTING (`app/logging_hooks.start_durable_run`/
+  `set_durable_attempt`) — for opted-in agents on a DB-backed session
+  (`/agents/{id}/invoke`, `/chat/message` — NEVER Playground, whose
+  `InMemorySessionService` has nothing to resume, and never the streaming
+  `/chat/message/stream` path), an `invocation_log` row with
+  `status='running'` is written BEFORE the turn's first `runner.run_async
+  ()` call, not after the whole turn finishes. A crash mid-turn therefore
+  leaves a resumable, discoverable trace instead of silently leaving no row
+  at all.
+
+  DURABLE, IDEMPOTENT TOOL CALLS — covered in full in 3.4's walkthrough of
+  `builder.py`'s before/after_tool callbacks. The short version: every real
+  tool execution's result is written SYNCHRONOUSLY (awaited, not fire-and-
+  forget — durability is the entire point) to `tool_call_log`, keyed by
+  `f"{invocation_id}:{function_call_id}"` (an id ADK itself assigns, unique
+  per exact call attempt). A resume that re-attempts a call ADK only
+  guarantees at-least-once for finds that key already recorded a success
+  and REPLAYS the cached output instead of re-executing the real tool —
+  critical for a tool with a real-world side effect (e.g. reserving
+  inventory) that must not fire twice.
+
+  EXPLICIT RESUME (`POST /api/reliability/runs/{id}/resume`, admin-only) —
+  loads the stuck `running` row, rebuilds the agent (3.4), and calls
+  `runner.run_async(invocation_id=..., new_message=None)` against the SAME
+  ADK session — ADK's own resumability logic continues from the last
+  persisted event. Deliberately EXPLICIT (an admin action), not automatic
+  or silently triggered by the next unrelated message.
+
+  CIRCUIT BREAKER + RETRY/BACKOFF (`circuit_breaker.py`, `resilient_call.
+  py`) — a plain in-memory, per-KEY state machine with three states:
+  `closed` (normal), `open` (short-circuiting — the downstream is presumed
+  broken, calls fail fast without even trying), `half_open` (cooldown
+  elapsed, the next call is a trial). `call_allowed(key)` gates whether a
+  call is attempted; `record_success`/`record_failure` update the state,
+  with `failure_threshold` (default 5) consecutive failures opening the
+  breaker and a `cooldown_seconds` (default 30) timer before a trial call
+  is allowed through again. IN-MEMORY ONLY — the module docstring says so
+  explicitly, and explains WHY this is correct rather than a shortcut: this
+  backend runs as a SINGLE instance by design (same constraint as `app/
+  rate_limit.py`'s hit counter), so there is no cross-process state to
+  coordinate, and "the breaker resets on redeploy" is the DESIRED behavior
+  ("try the downstream again after a restart"), not a gap to fix later.
+  Wraps every tool-registry call site that previously had ZERO timeout/
+  retry protection (`http_tool`, `sql_tool`, `mysql_tool`, `mongo_tool`,
+  `nl2sql_tool`, `retrieval_tool`).
+
+  SAGA / COMPENSATION (`compensation.py`) — on a turn ending in error, walks
+  that turn's ALREADY-SUCCEEDED tool calls in REVERSE completion order and,
+  for any whose tool declares a `compensation_tool_id` in its own `config`
+  (same free-form JSONB convention as `context_params`/`policy_id`),
+  invokes that compensating tool with the ORIGINAL call's arguments — e.g.
+  step 1 reserved something, step 4 failed, so step 1's reservation gets
+  released. Deliberately SIMPLE, not a general saga engine: a compensation
+  tool runs OUTSIDE any live ADK invocation (the turn has already ended,
+  there's no session left to run inside), so it gets only a minimal
+  `_CompensationToolContext` stand-in — a valid compensation tool must be
+  self-contained, with no dependency on policy/context_params injection.
+  The worked example proving this ACTUALLY FIRES, not just structurally
+  exists: `reliability_demo_agent` (seeded by `scripts/seed_reliability_
+  demo.py`, which you ran against both local and production databases
+  earlier) — it reserves demo inventory (`reserve_widgets`), then a
+  deliberately fragile "confirm" step (`confirm_order`, which raises for
+  `order_id="FORCE_FAIL"`) — a failed confirmation automatically releases
+  the earlier reservation via `release_widgets`, the compensation target
+  configured on `reserve_widgets`' own `config.compensation_tool_id`.
+
+  KNOWN LIMITATION, FOUND DURING LIVE VERIFICATION, NOT YET FIXED (again,
+  an honest gap this project's own documentation calls out rather than
+  hides): compensation triggers on `outcome.status == "error"` — a genuine
+  technical/infrastructure failure. A turn where the MODEL gracefully
+  narrates a failed step as a recovered "success" (no raised exception,
+  just a bad answer) does NOT trigger compensation, even though the
+  underlying multi-step saga didn't actually complete. This is the same
+  CLASS of problem SCIL's hallucination validator exists to catch — solving
+  it here would need a saga-completion check independent of the turn's
+  reported status, not simply a bigger compensation walk.
+
+  ENABLE PER AGENT: `model_config.durable_execution = {"enabled": true}`.
+
+--------------------------------------------------------------------------------
+3.11 DOMAINS BUILT ON THE PLATFORM (WORKED EXAMPLES)
+--------------------------------------------------------------------------------
+
+Each is a proof point for "generic, not one-off" (2.1's design principle) —
+later domains increasingly reuse infrastructure the earlier ones had to
+build.
+
+  STUDYBUDDY — 7 sub-agents + orchestrator, ported from a sibling project.
+              Uses `retrieval_tool` (RAG) + `sql_tool` + `image_gen_tool`.
+              SCIL deliberately off (3.9).
+
+  MARKET INTELLIGENCE — `stock_market_analyst`, `crypto_analyst`,
+              `forex_metals_analyst`, all on free/no-key public data
+              (Yahoo Finance, CoinGecko, frankfurter.app, gold-api.com).
+              `slide_reporting_agent` and `reporting_specialist` attach as
+              further sub-agents.
+
+  CREDIT FACILITY ANALYSIS — first worked example of the generic RLS
+              framework (`access_policies` + `data_entities` +
+              `data_query_tool`), zero domain-specific CODE. Row-level
+              access varies by persona (GCM: global; GSG: no L2
+              visibility; Non-GSG: assigned-companies-only; CCB: exact-
+              gfcid reference only), resolved from the caller's account or
+              their `soeid` (3.3). Runs on Claude Haiku 4.5.
+
+  REVENUE AND RETURNS ANALYSIS — second worked example on the SAME generic
+              pieces, deliberately WITHOUT `access_policies` (every user
+              sees all data) — proves the `data_entities` + `data_query_
+              tool` pattern isn't RLS-DEPENDENT. Also the base domain for
+              `self_healing_revenue_analyst` (the retry loop in isolation)
+              and `revenue_query_orchestrator` (query decomposition —
+              split a compound question into up to 3 sub-queries, run each
+              through the self-healing tool, synthesize).
+
+  SALES ANALYTICS — the worked example for the self-service domain-
+              onboarding wizard (`/onboarding/new-domain`): pick a
+              connection, pick a table, columns auto-introspected/
+              labeled/tagged, one click creates every `data_query_tool`,
+              publish gated behind a SMOKE TEST requiring at least one
+              real tool call (an agent that "answers" without ever
+              querying the database is treated as hallucinating, and the
+              wizard refuses to publish it).
+
+  NL2SQL ORCHESTRATOR (now folded into `agent_forge_orchestrator`, see
+              below) — the entry point across every structured-data
+              domain, built ENTIRELY on 3.5's coordination framework — the
+              concrete proof that pattern works for real, unrelated
+              domains, not just in theory.
+
+  REPORTING SPECIALIST — chart + slide + PDF/Excel export, ZERO domain
+              knowledge, attached as a sub-agent to BOTH `market_
+              intelligence_orchestrator`'s lineage AND `credit_facility_
+              analyst` — the concrete proof of cross-domain tool/agent
+              reuse.
+
+  SINGLE ORCHESTRATOR (`agent_forge_orchestrator`) — every orchestrator-
+              shaped agent this platform ever built (`market_intelligence_
+              orchestrator`, `studybuddy_orchestrator`, `nl2sql_
+              orchestrator`, a duplicate `india_fund_orchestrator`) was
+              collapsed into this ONE root via `scripts/consolidate_
+              orchestrators.py` — the exact script you ran against both
+              local and production databases in this same session. It
+              reused `market_intelligence_orchestrator`'s existing row id
+              (renamed in place) rather than creating a brand-new agent,
+              specifically so anything already referencing that id by
+              value keeps working. Retired orchestrators are `archived`,
+              never deleted — their version history is preserved.
+              `revenue_query_orchestrator` (its own real internal query-
+              decomposition wiring) was kept and demoted to a LEAF rather
+              than dismantled.
+
+--------------------------------------------------------------------------------
+3.12 PUBLISH, VERSIONING, AND THE APPROVAL WORKFLOW
+--------------------------------------------------------------------------------
+
+  DRAFT    — the live, editable config. Playground always builds fresh from
+             here (3.4), so iteration is immediate.
+  TEST GATE — publish is disabled in the UI until a Playground run has
+             succeeded against the EXACT current draft config (a
+             fingerprint of the draft is compared against what was last
+             tested) — an agent that "answers" without ever actually being
+             run isn't provably working yet.
+  PUBLISH  — as ADMIN: goes live immediately, freezing a new `agent_
+             versions` row and bumping `current_version`; any published
+             ANCESTOR orchestrator is also cache-invalidated (3.4), since
+             its own materialized tree would otherwise keep serving the
+             stale child forever. As DEVELOPER: freezes the current config
+             into an `agent_publish_requests` row (status=pending) instead
+             — an admin reviews and approves (publishing EXACTLY that
+             frozen snapshot, not whatever the draft has drifted to by
+             review time) or rejects.
+  ROLLBACK — admin-only, deliberately: restores the live draft to look
+             like an OLDER published version, then republishes THAT as a
+             BRAND-NEW version (history is never overwritten or deleted).
+             Not available to developers, because it republishes
+             immediately with no review step — a way around the approval
+             queue entirely if it were allowed.
+
+--------------------------------------------------------------------------------
+3.13 FRONTEND ARCHITECTURE, IN DEPTH
+--------------------------------------------------------------------------------
+
+Two surfaces, one codebase (`App.tsx`, 2.10):
+
+  ADMIN SHELL — `Layout.tsx` + role-gated routes (`RequireRole`, 2.10) for
+  Agent Builder, Tools/Skills libraries, Playground, SCIL Dashboard,
+  Usage/Monitoring/Audit dashboards, Debug Console, Reliability Dashboard,
+  user management, the domain-onboarding wizard. Auth: the static admin
+  token or a named admin/developer/viewer login, stored as `af_admin_
+  token`/`af_admin_role` in `localStorage` (see `lib/auth.ts`).
+
+  PUBLIC CHAT (`/chat`) — its own register/login flow (`af_user_token`/
+  `af_user_email`), a genuinely separate white-labeled surface. BYOK (3.14)
+  is enforced strictly here: a missing-API-key error from the backend
+  (`400`, `{"error": "missing_api_key", "provider": ...}`) opens an
+  `ApiKeyPrompt` modal instead of a generic error bubble, storing the
+  supplied key in `sessionStorage` only (`af_byok_gemini`/`af_byok_
+  anthropic` — session-only, not persisted across browser restarts) and
+  automatically resending the same message once supplied.
+
+  PLAYGROUND — uses the SAME BYOK mechanism as public chat: `api/
+  playground.ts` shares the `parseError`/`providerKeyHeaders` helpers with
+  `api/chat.ts`, and `PlaygroundChat.tsx` opens the same `ApiKeyPrompt`
+  modal on a missing-key error.
+
+  KEY PATTERNS ACROSS THE CODEBASE
+    - Every `api/*.ts` file wraps TanStack Query hooks (2.9) around ONE
+      backend resource; mutation hooks invalidate the relevant query key on
+      success — this is the entire "how does the UI stay in sync with
+      server state" story, no manual state-passing between components.
+    - ROLE-SCOPED UI: several dashboards render a genuinely DIFFERENT view
+      for a `developer` than an `admin` — not by hiding a broken feature
+      with CSS, but by passing `enabled: false` into the underlying query
+      (2.9) so the admin-only endpoint is never even CALLED, and by
+      adjusting which tabs/sections render at all (e.g. `ScilDashboardPage`
+      shows only the Evals tab to a developer, forcing `tab` to that value
+      and hiding the tab switcher entirely rather than showing a dead
+      option that would just 403 if clicked).
+    - SHARED COMPONENT REUSE: the same `EvalsTab` (SCIL) and
+      `ManageCollaboratorsModal` (3.3) components are reused verbatim
+      across different contexts, with role/ownership filtering applied at
+      the DATA layer (which agents show up in a picker) rather than
+      forking the component itself per context.
+
+  `Layout.tsx` CONCRETELY — the sidebar is built from small arrays of
+  `NavItem { to, label, icon, end, roles }` objects (see the actual
+  `buildItems`/`observeItems`/`governanceItems` arrays in that file),
+  filtered by the current user's role before rendering — adding a new page
+  to the sidebar is adding one object to one of these arrays, not writing
+  new conditional JSX. Section-open/closed state persists across sessions
+  via `localStorage` (`useSidebarGroupOpen`), keyed per section.
+
+--------------------------------------------------------------------------------
+3.14 SECURITY MODEL
+--------------------------------------------------------------------------------
+
+  BYOK (BRING YOUR OWN KEY) — `app/agent_runtime/byok.py`'s `resolve_
+  request_api_keys(..., allow_operator_fallback: bool)` is the ONE place
+  deciding whether the OPERATOR's own `.env` API key may ever be used as a
+  fallback:
+    - Public chat: `allow_operator_fallback=False`, ALWAYS — a visitor must
+      supply their own key; the operator's quota is never spent on public
+      traffic.
+    - Playground: conditional on role — `True` for admin (internal
+      tooling), `False` for developer (their own iteration spends their
+      own quota).
+    - `/invoke` (admin-only, machine-to-machine): `True` — not public
+      traffic, no role branch needed.
+  A supplied header (`X-Gemini-Api-Key`/`X-Anthropic-Api-Key`) ALWAYS takes
+  priority over any operator fallback, regardless of role.
+
+  ROW-LEVEL SECURITY — see 3.4(c). Enforced by a callback the model never
+  sees or controls, never by an instruction merely telling it to behave.
+
+  AUDIT LOGGING — `config_audit_log` is hash-chained (2.4/3.2) — every
+  config-mutating endpoint writes a row via `write_audit_log`.
+
+  SECRETS — `backend/.env` is LOCAL-DEVELOPMENT ONLY; every value in it
+  (and anything that has ever appeared in an AI coding assistant's tool
+  output, including this very conversation) should be treated as already
+  compromised before any hosted deploy. `app/config.py`'s `Settings`
+  validator (see 2.3/2.4's Pydantic discussion) enforces part of this
+  MECHANICALLY once `ENV != development`: refuses to even boot if `USER_
+  TOKEN_SECRET`/`AGENT_FORGE_API_TOKEN` are missing, still the placeholder
+  value, or under 32 characters, or if `CORS_ORIGINS` still contains a
+  localhost entry — this is real code, not just a checklist someone has to
+  remember to follow.
+
+  DATA RETENTION — `POST /api/data-retention/purge` (admin-only, dry-run by
+  default) deletes conversation/PII-bearing data older than `DATA_
+  RETENTION_DAYS` (default 90) for the caller's workspace. NOTHING calls
+  this automatically — there is no scheduler in this app — you run it by
+  hand or point a hosting provider's own cron feature at it.
+
+  GENERATED-FILE ACCESS — `/generated-images/{filename}` and `/generated-
+  files/{filename}` (see `main.py`'s `_serve_generated`) are gated by a
+  SIGNED, EXPIRING token query parameter (the same shape as an S3/GCS
+  pre-signed URL), never a plain static-file mount — these directories can
+  hold real exported business/financial documents, so unauthenticated
+  directory listing/guessing must not work.
+
+  UNHANDLED-EXCEPTION HANDLING — see 2.3's exception-handler discussion; a
+  raw traceback's `str()` can leak internal details that have no business
+  reaching an external client.
+
+--------------------------------------------------------------------------------
+3.15 HOSTING & DEPLOYMENT (INCLUDING THIS PROJECT'S REAL, LIVE DEPLOYMENT)
+--------------------------------------------------------------------------------
+
+Railway (2.11) is this project's documented, tested, and ACTUALLY USED
+host — this is not hypothetical: this exact codebase is live right now as
+Railway project "lavish-inspiration," service `agent_forge`, reachable at
+`https://agentforge-production-dc29.up.railway.app`, backed by a managed
+Postgres (`turntable.proxy.rlwy.net:13957/railway`) and a managed MySQL.
+Two services + managed Postgres (with pgvector) + managed MySQL + a
+persistent Volume for `generated_files`/`generated_images`. The backend
+MUST run as a SINGLE instance (not horizontally scaled) — `app/rate_
+limit.py`'s hit counter and the Playground's `InMemorySessionService`
+(2.2), and the reliability layer's circuit breaker (3.10), are all
+explicitly single-instance-only by design, not an oversight.
+
+REAL GOTCHAS THIS PROJECT ACTUALLY HIT AND FIXED (all now handled in CODE,
+not just documented as "remember to configure this manually"):
+
+  DATABASE_URL DRIVER MISMATCH — Railway's (and Heroku's) managed-Postgres
+  connection string is plain `postgres://`/`postgresql://` with no driver
+  specified, which SQLAlchemy resolves to the SYNC `psycopg2` dialect — not
+  installed here, since this app's engine is async-only via `asyncpg`
+  (2.4). Fixed with a Pydantic `field_validator` on `Settings.database_url`
+  (`app/config.py`, quoted in full in 2.4) that rewrites the scheme to
+  `postgresql+asyncpg://` regardless of what the host hands over — NO
+  manual env-var editing required on any host, including this project's
+  own Railway deployment.
+
+  google-adk's `[mcp]` EXTRA — see 2.2's version-pin discussion. A bare
+  `google-adk==2.4.0` install (no extra) leaves `McpToolset` silently
+  undefined on a FRESH install (like a Railway build), even though local
+  dev might work by accident if the `mcp` package happened to already be
+  installed from unrelated earlier work in that specific venv.
+
+  FRONTEND PORT BINDING — the frontend's static build is served by Caddy
+  (a web server), which was hardcoded to listen on `:80`, but Railway
+  injects a dynamic `$PORT` the container must actually listen on instead.
+  Fixed: `:{$PORT:80}` in the Caddyfile — uses Railway's `$PORT` when
+  present, falls back to 80 for local `docker-compose` (which sets no
+  `$PORT` and expects 80).
+
+  CORS_ORIGINS MISMATCH — a 400 on an OPTIONS preflight request is
+  Starlette's `CORSMiddleware` (2.3) itself rejecting an origin not in the
+  allow-list — a real, deliberate response, not a bug — `CORS_ORIGINS` must
+  exactly match the frontend's real origin (scheme + host, no trailing
+  slash), set on the BACKEND service, with the backend redeployed after any
+  change.
+
+SEED/MIGRATION SCRIPT CONVENTIONS (`backend/scripts/`, `backend/app/
+domains/*/seed_*.py`) — every one follows the same shape, which is exactly
+why you were able to safely run several of them against BOTH your local
+database and this project's real production database earlier in this
+session:
+  - IDEMPOTENT — safe to re-run; a "create if missing" script no-ops
+    (prints and returns) if its target already exists.
+  - `--reset` undoes ONLY what that SPECIFIC script created (identified by
+    a `SEED_MARKER`/`created_by` constant), never touching anything else,
+    including hand-built config from the admin UI.
+  - A "migration" script (as opposed to a "seed" script) — e.g. `migrate_
+    gemini_model.py`, `migrate_nl2sql_orchestrator_instructions.py`,
+    `consolidate_orchestrators.py`, `disable_planning.py`, `refresh_peer_
+    clause.py` — updates rows ALREADY in the database IN PLACE (and
+    republishes them, since `/chat`/`/invoke` build from the PUBLISHED
+    snapshot, not the live draft — editing the draft alone is invisible to
+    real traffic) rather than deleting and recreating, specifically to
+    avoid orphaning other data that references the existing row's id (e.g.
+    deleting and recreating an orchestrator would orphan its already-
+    seeded `ScilEvalCase` rows).
+  - Running a script against a HOSTED database: `railway run --service
+    <name> -- <command>` (2.11) executes LOCALLY with that service's real
+    environment variables injected — this is EXACTLY the mechanism used
+    earlier in this session to run `seed_reliability_demo.py`,
+    `consolidate_orchestrators.py`, `disable_planning.py`, and `refresh_
+    peer_clause.py` against the real production database, and it is how
+    every hosted seed/migration in this project's history has actually
+    been run — never via a Railway dashboard shell.
+
+--------------------------------------------------------------------------------
+3.16 TESTING PHILOSOPHY
+--------------------------------------------------------------------------------
+
+`cd backend && python -m pytest` runs against the REAL local Postgres
+`agent_forge` schema — no mocked database. Two kinds of real external
+calls: hermetic ones via `httpx.MockTransport` for HTTP-tool unit tests
+(fakes the HTTP layer, so no real network call happens, but exercises real
+request-building/response-parsing code), and one genuinely LIVE call in
+`test_playground.py` (real Gemini + real ADK + a real HTTP GET) that proves
+the FULL STACK actually works end to end, not just that each piece works in
+isolation.
+
+KNOWN CHARACTERISTIC, DELIBERATELY NOT TREATED AS A BUG: tests create rows
+with random-suffix names (a `unique_name()` fixture — e.g. `agent_a1b2c3d4`,
+`dev_a1b2c3d4@example.com`) directly in that REAL database and do not clean
+up after themselves — repeated test runs accumulate this data over time.
+`scripts/cleanup_verification_artifacts.py` (which you inspected via a
+dry-run against production earlier — production came back completely
+clean, 0 rows to delete) exists specifically to sweep this debris
+periodically, using REFERENTIAL orphan-detection for tools/skills (not name
+matching, so a real-but-undocumented tool that happens to lack a `created_
+by` marker is never mistakenly swept) plus an explicit allowlist for the
+handful of real agents that also happen to lack one.
+
+Deletion order for a manual cleanup matters (a real lesson in relational
+integrity): `agents`/`tools` are referenced WITHOUT cascade by `invocation_
+log`, `tool_call_log`, and every SCIL table — those must be deleted FIRST,
+or the delete fails on a foreign-key violation. `agent_tools`/`agent_
+skills`/`agent_subagents`/`agent_versions` DO cascade on their parent
+agent's own deletion.
+
+--------------------------------------------------------------------------------
+3.17 SCRIPTS — HOW THE DATABASE ACTUALLY GETS POPULATED
+--------------------------------------------------------------------------------
+
+`backend/scripts/` is where every "make the database reflect the platform's
+intended state" operation lives, following the conventions in 3.15. A
+non-exhaustive map of what exists and why (useful as a reference the next
+time you need to run — or write — one of these):
+
+  seed_*.py                 — CREATE agents/tools/data if missing (idempotent).
+    seed_demo_data.py             synthetic dashboard data
+    seed_studybuddy_agents.py     StudyBuddy's 7 sub-agents + orchestrator
+    seed_market_agents.py         Market Intelligence agent family
+    seed_reporting_specialist.py  generic chart/slide/export specialist
+    seed_reliability_demo.py      durable-execution saga/compensation demo
+    seed_nl2sql_orchestrator.py   the (now-archived) nl2sql router
+    seed_chart_tool.py, seed_slide_reporting_agent.py, seed_agentic_sql_
+      patterns.py, seed_eval_cases.py — narrower, feature-specific seeds.
+  migrate_*.py               — UPDATE rows already in the database in place.
+    migrate_gemini_model.py            fixes agents still on the old default model
+    migrate_nl2sql_orchestrator_instructions.py
+                                        brings an existing orchestrator's
+                                        prompt in line with a new shared
+                                        builder, without a destructive reset
+  consolidate_orchestrators.py — the one-time (but idempotent-ISH — see the
+      earlier conversation's finding that re-running it WOULD silently
+      re-enable planning) collapse of every orchestrator into `agent_forge_
+      orchestrator`. Treat this one with extra care: read its own docstring
+      before re-running it against any database, ever.
+  disable_planning.py       — turns `model_config.planning.enabled` back OFF
+      wherever `consolidate_orchestrators.py` turned it on — a live-tested
+      regression fix (gemini-3.5-flash's unreliable ReAct-tag compliance),
+      not just a preference.
+  refresh_peer_clause.py    — re-applies the CURRENT peer-clause wording
+      (3.5) to every specialist under the root orchestrator.
+  cleanup_verification_artifacts.py — dry-run by default; `--confirm` to
+      actually delete test-suite debris (3.16).
+  rename_agent.py <old> <new> — renames a published agent and republishes it,
+      so the ADK build tree (3.4) actually picks up the new name — NOT the
+      same as a bare `UPDATE agents SET name = ...`, which would leave a
+      cached build serving the stale name.
+  audit_fix_agents.py, republish_stale_model_agents.py — narrower one-off
+      fixes for specific data drift found in past sessions.
+
+  `app/domains/<domain>/seed_data.py` / `seed_agent.py` — per-DOMAIN seed
+  pairs (credit_facility, revenue_and_returns): `seed_data` populates the
+  domain's own MySQL tables + demo logins; `seed_agent` creates the
+  matching `access_policies`/`data_entities`/`tools`/`agent` rows in
+  Postgres. Run as `python -m app.domains.credit_facility.seed_data`
+  (module invocation, not a bare script path) because these live inside the
+  `app` package (unlike `backend/scripts/`, which are bare, non-package
+  scripts run as `python scripts/whatever.py`).
+
+================================================================================
+PART 4 — GLOSSARY
+================================================================================
+
+ADK              Google's Agent Development Kit — the framework this whole
+                 backend is built on (2.2).
+Agent (ADK)      `google.adk.agents.Agent` — one node in a tree: an
+                 instruction, a model, tools, optional sub-agents.
+Agent (platform) A `agents` table row in THIS project's Postgres — config
+                 data, not yet a running object, until `builder.py` builds it.
+Alembic          SQLAlchemy's migration tool (2.4).
+asyncpg          The async PostgreSQL driver this project's SQLAlchemy
+                 engine uses.
+BYOK             Bring Your Own [API] Key — 3.14.
+Circuit breaker  A state machine that stops calling a downstream dependency
+                 once it looks broken, to fail fast instead of piling up
+                 timeouts (3.10).
+Compensation     Rolling back an already-succeeded step after a LATER step
+                 in the same multi-step turn fails (3.10, aka "saga pattern").
+CORS             Cross-Origin Resource Sharing — a browser-enforced rule
+                 about which origins may read a response (2.3).
+Durable          Surviving a process crash by checkpointing enough state to
+execution        resume, and making tool calls idempotent-safe to retry (3.10).
+Embedding        A fixed-length vector representing a piece of text's
+                 MEANING, produced by a small ML model (2.5).
+FastAPI          The Python web framework this backend's HTTP layer is
+                 built on (2.3).
+FunctionTool     ADK's wrapper turning a plain function (or, here, a
+                 `BaseTool` subclass) into something a model can call (2.2).
+LiteLlm          ADK's adapter routing an agent to a non-Gemini model
+                 provider (e.g. Anthropic Claude) via the `litellm` library.
+MCP              Model Context Protocol — a standard way to expose tools to
+                 any compatible AI client, independent of framework (2.7).
+ORM              Object-Relational Mapper — maps database tables to
+                 language-native classes/objects (2.4, e.g. SQLAlchemy).
+pgvector         A Postgres extension adding a vector column type + fast
+                 similarity search (2.5).
+Planner / ReAct  An optional instructional mode that asks a model to show
+                 its reasoning in a structured, taggable format (2.2, 3.6).
+RAG              Retrieval-Augmented Generation — embedding + searching a
+                 knowledge base to ground an answer in real reference text.
+RLS              Row-Level Security — restricting which ROWS of data a
+                 given caller may see/query, enforced here in application
+                 code (3.4c), not a database-native RLS feature.
+Runner (ADK)     `google.adk.runners.Runner` — drives one agent turn,
+                 yielding events as the model/tools progress (2.2).
+SCIL             Self-Correcting Intelligence Layer — this project's own
+                 cost/correctness layer (3.9).
+Session (ADK)    Persisted conversation history + state for one user/
+                 conversation, backed by a `SessionService` (2.2).
+sub_agents       The mechanism making an `AdkAgent` a multi-agent tree
+                 (2.2), coordinated via `transfer_to_agent` tool calls (3.5).
+TanStack Query   A frontend library managing server-state caching/
+                 refetching (2.9, aka "React Query").
+Tool (ADK)       Anything a model can request be executed on its behalf —
+                 a function, or a whole toolset (2.2).
+Tool (platform)  A `tools` table row — config data defining one callable
+                 capability, dispatched by `tool_type` (3.7).
+Toolset          A `BaseToolset` — a CONNECTION exposing multiple tools at
+                 once (e.g. `McpToolset`), as opposed to one single tool (2.2).
+Vite             The frontend build tool/dev server (2.8).
+Workspace        This project's multi-tenancy boundary (currently, in
+                 practice, always the single default one) (3.2).
+
+================================================================================
+PART 5 — SUGGESTED READING ORDER THROUGH THE REAL CODE
+================================================================================
+
+If you want to go from "read this document" to "confidently read and edit
+this codebase," here is a concrete order, cheapest/most-foundational first:
+
+  1. `README.md` (repo root) — the maintainers' own running summary; read
+     it now that Part 2/3 above have given you the vocabulary to understand
+     every sentence of it.
+  2. `Agent Forge - Comprehensive Design Document.txt` (repo root) — the
+     fuller version of Part 3 above, written by/for the maintainers
+     directly; cross-reference anything in Part 3 that felt too compressed.
+  3. `backend/app/models/agents.py`, `tools.py`, `skills.py` — the actual
+     table definitions behind everything in section 3.2. Reading the real
+     column list is the fastest way to stop having to guess a shape.
+  4. `backend/app/agent_runtime/builder.py` — re-read this file directly
+     now that 3.4 has walked you through it; you should be able to follow
+     every line.
+  5. `backend/app/agent_runtime/orchestration_patterns.py` — short, and
+     directly explains itself once you understand `transfer_to_agent`.
+  6. `backend/app/tool_registry/factory.py` then pick ONE tool type file
+     (`http_tool.py` is the simplest) and read it end to end.
+  7. `backend/app/playground_api/router.py` — the biggest file in the
+     backend, and the one that ties SCIL + durable execution + the agent
+     runtime + observability all together into one real request. Don't try
+     to absorb it in one sitting; use 3.9/3.10's descriptions as a map.
+  8. `backend/app/main.py` — now that you've seen what it wires together,
+     it should read as a short table of contents, not a wall of imports.
+  9. `frontend/src/App.tsx` then `frontend/src/components/Layout.tsx` —
+     the frontend's own table of contents (every route, every nav item).
+  10. Pick ONE feature end to end: e.g. open `frontend/src/api/reliability.
+      ts`, then `frontend/src/pages/ReliabilityDashboardPage.tsx`, then
+      `backend/app/reliability_api/router.py`, then `backend/app/
+      reliability/circuit_breaker.py` — following one feature from UI to
+      database is the fastest way to see how every layer in Part 3
+      actually connects in practice.
+  11. `backend/scripts/consolidate_orchestrators.py` — by now you have
+      enough context to read this not as a scary one-off script, but as a
+      worked example of "how do you safely mutate a live agent tree's
+      structure" using everything from sections 3.2–3.5 at once.

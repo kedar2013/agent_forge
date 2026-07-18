@@ -4,6 +4,7 @@ import {
   Bot,
   Bug,
   ChevronDown,
+  ClipboardCheck,
   Database,
   DatabaseZap,
   FileClock,
@@ -47,6 +48,13 @@ const buildItems: NavItem[] = [
   { to: '/data-entities', label: 'Data Entities', icon: Database, end: false, roles: ['admin', 'viewer'] },
   { to: '/onboarding/new-domain', label: 'New Domain', icon: PlusSquare, end: false, roles: ['admin'] },
   { to: '/skills', label: 'Skills', icon: Sparkles, end: false, roles: ['admin', 'viewer', 'developer'] },
+  {
+    to: '/prompt-evaluator',
+    label: 'Prompt Evaluator',
+    icon: ClipboardCheck,
+    end: false,
+    roles: ['admin', 'developer'],
+  },
 ]
 
 const chatItem: NavItem = { to: '/chat', label: 'Chat', icon: MessageSquare, end: false, roles: ['admin', 'developer'] }

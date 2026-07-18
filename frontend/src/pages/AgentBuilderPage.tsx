@@ -593,7 +593,7 @@ export default function AgentBuilderPage() {
 
         {/* Right: live preview + actions */}
         <div className="space-y-3">
-          <EffectivePromptPreview baseInstruction={draft.base_instruction} skills={agent.skills} />
+          <EffectivePromptPreview baseInstruction={draft.base_instruction} skills={agent.skills} agentId={agent.id} />
 
           <div className="flex items-center gap-2">
             <Button

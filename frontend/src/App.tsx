@@ -24,6 +24,7 @@ import PublishRequestsPage from './pages/PublishRequestsPage'
 import DebugConsolePage from './pages/DebugConsolePage'
 import ScilDashboardPage from './pages/ScilDashboardPage'
 import ReliabilityDashboardPage from './pages/ReliabilityDashboardPage'
+import PromptEvaluatorPage from './pages/PromptEvaluatorPage'
 import { getStoredRole, getStoredToken, type AdminShellRole } from './lib/auth'
 
 const queryClient = new QueryClient()
@@ -66,6 +67,14 @@ function AdminApp() {
           <Route path="/agents/new" element={<AgentBuilderPage />} />
           <Route path="/agents/:id" element={<AgentBuilderPage />} />
           <Route path="/agents/:id/playground" element={<PlaygroundPage />} />
+          <Route
+            path="/prompt-evaluator"
+            element={
+              <RequireRole roles={['admin', 'developer']}>
+                <PromptEvaluatorPage />
+              </RequireRole>
+            }
+          />
           <Route
             path="/monitoring"
             element={

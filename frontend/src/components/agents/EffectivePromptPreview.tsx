@@ -1,4 +1,5 @@
-import { Eye } from 'lucide-react'
+import { ClipboardCheck, Eye } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import type { AttachedSkill } from '../../api/types'
 
 /**
@@ -10,16 +11,31 @@ import type { AttachedSkill } from '../../api/types'
 export default function EffectivePromptPreview({
   baseInstruction,
   skills,
+  agentId,
 }: {
   baseInstruction: string
   skills: AttachedSkill[]
+  /** When provided, shows a shortcut into the System Prompt Evaluator
+   * pre-selecting this agent — omit for contexts with no real agent yet
+   * (e.g. a not-yet-saved draft). */
+  agentId?: string
 }) {
   const ordered = [...skills].sort((a, b) => a.attach_order - b.attach_order)
 
   return (
     <div className="rounded-[--radius-card] border border-slate-200 bg-white shadow-[--shadow-card] dark:border-slate-800 dark:bg-slate-900">
-      <div className="flex items-center gap-1.5 border-b border-slate-200 px-3 py-2 text-sm font-medium dark:border-slate-800">
-        <Eye size={15} className="text-slate-400" /> Effective prompt preview
+      <div className="flex items-center justify-between gap-1.5 border-b border-slate-200 px-3 py-2 text-sm font-medium dark:border-slate-800">
+        <span className="flex items-center gap-1.5">
+          <Eye size={15} className="text-slate-400" /> Effective prompt preview
+        </span>
+        {agentId && (
+          <Link
+            to={`/prompt-evaluator?agent=${agentId}`}
+            className="flex items-center gap-1 text-xs font-medium text-brand-600 hover:text-brand-700 dark:text-brand-400"
+          >
+            <ClipboardCheck size={13} /> Evaluate prompt
+          </Link>
+        )}
       </div>
       <div className="max-h-[32rem] overflow-y-auto p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap">
         <div>{baseInstruction || <span className="text-slate-400">(no base instruction yet)</span>}</div>
