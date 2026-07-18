@@ -100,7 +100,16 @@ def build_peer_clause() -> str:
         "your parent orchestrator with a brief note on what still needs answering, so "
         "it can route the rest to the right specialist (there may be more than one "
         "still outstanding). Never silently drop the out-of-domain part, and never "
-        "tell the user you're transferring — just do it."
+        "tell the user you're transferring — just do it.\n\n"
+        "This also applies to meta-questions about the assistant itself — 'what can "
+        "you do', 'what are your capabilities', 'who are you', 'what can I ask you' — "
+        "these are NOT about your domain specifically, even though you could technically "
+        "answer with just your own scope. A conversation can resume directly on you "
+        "(skipping your parent) if you answered the last message, so you may be the "
+        "first agent to see a meta-question like this even though it was never meant for "
+        "you alone. Silently transfer back to your parent orchestrator for these instead "
+        "of self-describing — it knows the full roster and can give a complete answer; "
+        "you only know your own domain."
     )
     return f"{_PEER_CLAUSE_START}\n{body}\n{_PEER_CLAUSE_END}"
 

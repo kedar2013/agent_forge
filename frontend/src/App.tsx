@@ -23,6 +23,7 @@ import UsersPage from './pages/UsersPage'
 import PublishRequestsPage from './pages/PublishRequestsPage'
 import DebugConsolePage from './pages/DebugConsolePage'
 import ScilDashboardPage from './pages/ScilDashboardPage'
+import ReliabilityDashboardPage from './pages/ReliabilityDashboardPage'
 import { getStoredRole, getStoredToken, type AdminShellRole } from './lib/auth'
 
 const queryClient = new QueryClient()
@@ -95,6 +96,14 @@ function AdminApp() {
             element={
               <RequireRole roles={['admin', 'developer']}>
                 <ScilDashboardPage />
+              </RequireRole>
+            }
+          />
+          <Route
+            path="/reliability"
+            element={
+              <RequireRole roles={['admin']}>
+                <ReliabilityDashboardPage />
               </RequireRole>
             }
           />

@@ -86,7 +86,15 @@ export default function ChatPage() {
     setActiveSessionId(sessionId)
     setLastActiveSessionId(sessionId)
     setHistoryLoaded(false)
-    if (agentNameHint) setSelectedBot(agentNameHint)
+    // Only restore a past conversation's remembered bot when there's more
+    // than one to choose from. With exactly one orchestrator (the norm now),
+    // restoring here would race the "force to the sole orchestrator" effect
+    // below — this call is chained behind refreshConversations() +
+    // fetchChatHistory() (two round trips) and can resolve AFTER that
+    // effect already ran off fetchOrchestrators() (one round trip), silently
+    // clobbering selectedBot back to a legacy agent_name like
+    // credit_facility_analyst that isn't even reachable directly anymore.
+    if (agentNameHint && orchestrators.length > 1) setSelectedBot(agentNameHint)
     try {
       const history = await fetchChatHistory(sessionId)
       const restored = history.flatMap((turn): Turn[] => [
@@ -117,7 +125,7 @@ export default function ChatPage() {
     fetchOrchestrators()
       .then((list) => {
         setOrchestrators(list)
-        setSelectedBot((current) => current || list.find((o) => o.name === 'market_intelligence')?.name || list[0]?.name || '')
+        setSelectedBot((current) => current || list[0]?.name || '')
       })
       .catch(() => {})
     refreshConversations().then((list) => {
@@ -135,6 +143,20 @@ export default function ChatPage() {
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
   }, [turns, pending])
+
+  // With exactly one orchestrator (the norm now — see agent_forge_orchestrator),
+  // the bot picker below is hidden (only rendered when orchestrators.length >
+  // 1), so there is no way for the visitor to manually correct selectedBot —
+  // it must always resolve to that one bot, overriding whatever a restored
+  // past conversation's agent_name happened to be (e.g. a legacy session that
+  // talked directly to a since-consolidated specialist like
+  // credit_facility_analyst). Runs after both fetchOrchestrators and
+  // loadConversation settle, regardless of which resolves first.
+  useEffect(() => {
+    if (orchestrators.length === 1) {
+      setSelectedBot(orchestrators[0].name)
+    }
+  }, [orchestrators])
 
   function handleLogout() {
     clearUserSession()

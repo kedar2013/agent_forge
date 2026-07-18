@@ -36,6 +36,7 @@ import pymysql
 from dbutils.pooled_db import PooledDB
 from dotenv import load_dotenv
 
+from app.reliability.resilient_call import resilient_call
 from app.tool_registry.base import ConfigDrivenTool
 from app.tool_registry.serialize import to_json_safe
 
@@ -112,7 +113,7 @@ class MySQLQueryTool(ConfigDrivenTool):
                 conn.close()
 
         try:
-            rows = await asyncio.to_thread(_run_query)
+            rows = await resilient_call(f"mysql_tool:{self.name}", lambda: asyncio.to_thread(_run_query))
         except Exception as exc:
             return {"error": f"Query failed: {exc}"}
 

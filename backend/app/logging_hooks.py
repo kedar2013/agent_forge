@@ -75,6 +75,54 @@ def log_invocation_fire_and_forget(**kwargs: Any) -> None:
     asyncio.create_task(_write_invocation_log(**kwargs))
 
 
+async def start_durable_run(
+    *,
+    agent_id: uuid.UUID | None,
+    agent_version: int,
+    workspace_id: uuid.UUID | None,
+    adk_session_id: str,
+    adk_user_id: str,
+    adk_app_name: str,
+    invoked_by: str | None,
+) -> uuid.UUID:
+    """Eagerly, SYNCHRONOUSLY (awaited, unlike every other write in this
+    file) inserts a 'running' InvocationLog row before this turn's first
+    `runner.run_async()` call — the durable checkpoint anchor a
+    crash-recovery resume (`app/reliability_api/router.py`) needs. Only
+    called for durable-execution-enabled agents running on a DB-backed
+    session (see `playground_api/router.py`'s `_run_turn`); every other
+    agent keeps today's insert-once-at-the-end behavior via
+    `log_invocation_fire_and_forget`."""
+    async with async_session_factory() as session:
+        invocation = InvocationLog(
+            agent_id=agent_id,
+            agent_version=agent_version,
+            workspace_id=workspace_id,
+            trace_id=adk_session_id,
+            status="running",
+            latency_ms=0,
+            adk_session_id=adk_session_id,
+            adk_user_id=adk_user_id,
+            adk_app_name=adk_app_name,
+            invoked_by=invoked_by,
+        )
+        session.add(invocation)
+        await session.commit()
+        return invocation.id
+
+
+async def set_durable_attempt(invocation_log_id: uuid.UUID, adk_invocation_id: str) -> None:
+    """Overwrites the 'currently live attempt' pointer before each
+    `runner.run_async()` call for this turn (the initial attempt, or any
+    SCIL retry) — always points at whichever attempt is actually in flight,
+    so a crash mid-turn leaves the RIGHT id for a resume to continue from."""
+    async with async_session_factory() as session:
+        invocation = await session.get(InvocationLog, invocation_log_id)
+        if invocation is not None:
+            invocation.adk_invocation_id = adk_invocation_id
+            await session.commit()
+
+
 async def _write_invocation_log(
     *,
     agent_id: uuid.UUID | None,
@@ -83,6 +131,7 @@ async def _write_invocation_log(
     trace_id: str | None,
     status: str,
     latency_ms: int,
+    invocation_log_id: uuid.UUID | None = None,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
     estimated_cost_usd: float | None = None,
@@ -125,23 +174,30 @@ async def _write_invocation_log(
                         agent_version = candidate_version
                         break
 
-            invocation = InvocationLog(
-                agent_id=agent_id,
-                agent_version=agent_version,
-                workspace_id=workspace_id,
-                trace_id=trace_id,
-                otel_trace_id=otel_trace_id,
-                status=status,
-                error_category=error_category,
-                latency_ms=latency_ms,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                estimated_cost_usd=estimated_cost_usd,
-                error_message=error_message,
-                invoked_by=invoked_by,
-                transcript=transcript,
-            )
-            session.add(invocation)
+            invocation: InvocationLog | None = None
+            if invocation_log_id is not None:
+                # Durable-execution path: the row was already inserted
+                # (status='running') before the turn started, by
+                # start_durable_run — update it in place rather than
+                # inserting a second row for the same turn.
+                invocation = await session.get(InvocationLog, invocation_log_id)
+            if invocation is None:
+                invocation = InvocationLog(id=invocation_log_id) if invocation_log_id else InvocationLog()
+                session.add(invocation)
+            invocation.agent_id = agent_id
+            invocation.agent_version = agent_version
+            invocation.workspace_id = workspace_id
+            invocation.trace_id = trace_id
+            invocation.otel_trace_id = otel_trace_id
+            invocation.status = status
+            invocation.error_category = error_category
+            invocation.latency_ms = latency_ms
+            invocation.input_tokens = input_tokens
+            invocation.output_tokens = output_tokens
+            invocation.estimated_cost_usd = estimated_cost_usd
+            invocation.error_message = error_message
+            invocation.invoked_by = invoked_by
+            invocation.transcript = transcript
             await session.flush()
 
             tool_names = [call["name"] for call in (tool_calls or []) if call.get("name")]

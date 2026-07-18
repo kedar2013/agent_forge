@@ -93,7 +93,9 @@ mutual-fund tools:
 | `stock_market_analyst` | Stocks, ETFs, indices — quotes, trailing returns | Yahoo Finance (unauthenticated `chart`/`search` endpoints) |
 | `crypto_analyst` | Cryptocurrency prices, trends, trending coins | CoinGecko free API |
 | `forex_metals_analyst` | Currency exchange rates/conversion, precious metals spot prices | frankfurter.app + gold-api.com |
-| `market_intelligence_orchestrator` | Orchestrator — routes to the specialists above | — |
+
+Routed via `agent_forge_orchestrator` — see "Single orchestrator" below;
+this family no longer has its own dedicated orchestrator.
 
 MCP servers live in `backend/mcp_servers/{stocks,crypto,forex_metals}_server.py`.
 Seed (or reseed) the agent family with:
@@ -234,6 +236,138 @@ enforced, multi-tenancy hardening beyond the default workspace, live
 retrieval/pgvector testing outside the StudyBuddy import, and market-news
 sentiment agents (no reliable free/no-key news API was available).
 
+### Durable Execution & Reliability
+
+Checkpointing/resume-after-crash, idempotent tool-call replay, circuit
+breakers, and saga/compensation — per-agent and off by default, mirroring
+SCIL's `model_config.scil` opt-in shape exactly. Complements SCIL: SCIL
+corrects wrong model *content*; this handles infrastructure failures
+(process crashes, flaky downstream calls, partially-completed multi-step
+turns). Builds on a real ADK 2.4.0 primitive
+(`google.adk.apps.app.ResumabilityConfig`, `@experimental`) rather than a
+hand-rolled checkpoint engine — the Postgres-native pieces here exist
+specifically to close what ADK's own resumability contract leaves open
+("tool call to resume needs to be idempotent because we only guarantee
+at-least-once behavior once resumed") and to make a crashed turn
+*discoverable and durably recorded*, not just theoretically resumable:
+
+- **Eager, incremental checkpointing** (`app/logging_hooks.start_durable_run`/
+  `set_durable_attempt`): for opted-in agents on a DB-backed session
+  (`/agents/{id}/invoke`, `/chat/message` — never Playground, whose
+  `InMemorySessionService` has nothing to resume, and never the streaming
+  `/chat/message/stream`, which already has its own "simpler, no retry
+  layer" precedent), `invocation_log` gets a `status='running'` row
+  *before* the turn's first `runner.run_async()` call, not after the whole
+  turn finishes — a crash mid-turn leaves a resumable trace instead of no
+  row at all.
+- **Durable, idempotent tool calls** (`app/agent_runtime/builder.py`'s
+  `before_tool_callback`/`after_tool_callback`): each tool call's result is
+  written to `tool_call_log` synchronously (awaited, not fire-and-forget)
+  the moment it completes, keyed by an idempotency key ADK itself assigns
+  (`invocation_id:function_call_id`). A resume that re-attempts the one
+  call ADK only guarantees at-least-once for finds that key already
+  recorded a success and replays the cached output instead of re-executing.
+- **Explicit resume** (`POST /api/reliability/runs/{id}/resume`, admin-only):
+  loads the stuck `running` row, rebuilds the agent, and calls
+  `runner.run_async(invocation_id=..., new_message=None)` against the same
+  ADK session — ADK's own resumability continues from the last persisted
+  event. Deliberately explicit, not automatic/silent-on-next-message.
+- **Circuit breaker + retry/backoff** (`app/reliability/circuit_breaker.py`,
+  `resilient_call.py`): in-memory, per-tool, same single-instance caveat as
+  `app/rate_limit.py` (a breaker resetting on redeploy is correct, not a
+  gap). Wraps every tool-registry call site that had zero timeout/retry
+  protection (`http_tool`, `sql_tool`, `mysql_tool`, `mongo_tool`,
+  `nl2sql_tool`, `retrieval_tool`) — generalizes the retry-with-backoff
+  pattern already proven in `mcp_servers/_http_retry.py`.
+- **Saga/compensation** (`app/reliability/compensation.py`): on a turn
+  ending in error, walks that turn's already-succeeded tool calls in
+  reverse order and invokes any configured `compensation_tool_id` (a plain
+  `tools.config` key, same convention as `context_params`/`policy_id`).
+  Worked example proving it actually fires, not just structurally wired up:
+  `reliability_demo_agent` (`scripts/seed_reliability_demo.py`) reserves
+  demo inventory, then a deliberately-fragile "confirm" step — a failed
+  confirmation automatically releases the reservation.
+
+Enable per agent via `model_config`:
+
+```json
+"durable_execution": { "enabled": true }
+```
+
+**Known limitation, found during live verification, not yet fixed:** compensation
+triggers on `outcome.status == "error"` (a technical/infrastructure
+failure) — a turn where the model gracefully narrates a failed step as a
+recovered "success" (no raised exception) does NOT trigger compensation,
+even though the underlying saga didn't actually complete. Same class of
+problem SCIL's hallucination validator exists for; solving it here would
+need a saga-completion check independent of turn status, not just a bigger
+compensation walk.
+
+### Single orchestrator & Planner/ReAct
+
+Every orchestrator-shaped agent (`market_intelligence_orchestrator`,
+`studybuddy_orchestrator`, `nl2sql_orchestrator`, and a duplicate published
+`india_fund_orchestrator`) was collapsed into ONE root,
+`agent_forge_orchestrator` (`scripts/consolidate_orchestrators.py` — reused
+`market_intelligence_orchestrator`'s existing id/rename mechanics rather
+than creating a new agent). It routes across every real domain — market
+intelligence, credit risk, revenue/sales analytics, StudyBuddy tutoring —
+using the same generic router-prompt builder every orchestrator here already
+used (`app/agent_runtime/orchestration_patterns.py`, no new prompt-building
+code). The retired orchestrators are `archived`, not deleted, preserving
+their version history; `chat_api`'s `CHATBOT_AGENT_NAME` default now points
+at the new root. `revenue_query_orchestrator` (an older query-decomposition/
+scratchpad pattern with its own real internal tool/child wiring) was kept
+and demoted to a leaf rather than dismantled.
+
+**Planner/ReAct** (`google.adk.planners.PlanReActPlanner` — not implemented
+anywhere before this; ADK ships it as a real, fully-wired primitive,
+confirmed by reading `flows/llm_flows/_nl_planning.py` directly) is enabled
+per agent via `model_config.planning.enabled`, mirroring SCIL/durable-
+execution's opt-in shape:
+
+```json
+"planning": { "enabled": true }
+```
+
+`app/agent_runtime/builder.py` passes `planner=PlanReActPlanner()` into
+`AdkAgent(...)` when set — decided per-node from that agent's own config
+(unlike durable execution, planning isn't inherited from a root; each agent
+in a tree opts in independently). Turned on for `agent_forge_orchestrator`
+and every real leaf specialist EXCEPT `flashcard_agent`/`quiz_agent` (their
+`output_schema` needs strict JSON, which cannot coexist with the planner's
+free-text `/*PLANNING*/…/*ACTION*/…/*FINAL_ANSWER*/` format) and
+`reliability_demo_agent` (out of scope — a platform-capability demo, not a
+business specialist).
+
+ADK marks the planner's reasoning/plan/action text as `part.thought = True`
+on the parts it yields — `_execute_run`/`_stream_turn`
+(`app/playground_api/router.py`) split on that flag so raw ReAct tags never
+reach the user-facing answer (still recorded as a `model_text`
+`AgentEventLog` row with `detail.reasoning = true` for the Debug Console).
+Confirmed live (real Gemini calls, not just unit tests): a cross-domain
+question correctly transferred through `crypto_analyst` and
+`fund_analyst_agent` and composed one clean answer with zero leaked tags.
+**Honest caveat, not glossed over**: the planning instruction is genuinely
+appended to every request for an opted-in agent (traced through ADK's
+`_nl_planning.request_processor`, unconditional whenever `agent.planner` is
+set) — but `PlanReActPlanner` is purely instructional (unlike
+`BuiltInPlanner`, which wraps a model's native thinking-config support), so
+whether the model actually emits the tagged format is model-compliance-
+dependent; `gemini-3.5-flash` did not emit the format in this session's live
+test, so no `reasoning: true` events have been observed yet in practice,
+even though the wiring is correct and the leak-prevention path is real.
+
+### Cleanup
+
+`scripts/cleanup_verification_artifacts.py --confirm` removes test-suite-
+accumulated debris (the pytest `unique_name()` fixture pattern — see
+Testing Philosophy above) using referential orphan-detection for tools/
+skills (not name matching, so a real-but-undocumented tool that happens to
+lack a `created_by` marker is never caught) plus an explicit allowlist for
+the handful of real agents that also lack one. `--dry-run` (the default)
+only prints what would be deleted.
+
 ## Backend setup
 
 ```bash
@@ -256,6 +390,7 @@ python scripts/seed_demo_data.py                        # synthetic dashboard da
 python scripts/seed_studybuddy_agents.py                # StudyBuddy's 7 sub-agents + orchestrator
 python scripts/seed_market_agents.py                    # Market Intelligence agent family
 python scripts/seed_reporting_specialist.py             # generic chart/slide/export specialist
+python scripts/seed_reliability_demo.py                 # durable-execution saga/compensation worked example
 python -m app.domains.credit_facility.seed_data          # Credit Facility MySQL demo data
 python -m app.domains.credit_facility.seed_agent         # Credit Facility access policies/tools/agent
 ```

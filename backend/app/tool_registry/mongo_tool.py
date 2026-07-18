@@ -35,6 +35,7 @@ from typing import Any
 
 from motor.motor_asyncio import AsyncIOMotorClient
 
+from app.reliability.resilient_call import resilient_call
 from app.tool_registry._templating import UNSET, bind_template
 from app.tool_registry.base import ConfigDrivenTool
 from app.tool_registry.serialize import to_json_safe
@@ -73,11 +74,13 @@ class MongoQueryTool(ConfigDrivenTool):
             limit = self._config.get("max_limit", 50)
         limit = min(int(limit), self._config.get("max_limit", 100))
 
-        cursor = collection.find(mongo_filter, projection)
-        sort = self._config.get("sort")
-        if sort:
-            cursor = cursor.sort([tuple(pair) for pair in sort])
-        cursor = cursor.limit(limit)
+        async def _run_query() -> list[dict]:
+            cursor = collection.find(mongo_filter, projection)
+            sort = self._config.get("sort")
+            if sort:
+                cursor = cursor.sort([tuple(pair) for pair in sort])
+            cursor = cursor.limit(limit)
+            return [to_json_safe(doc) async for doc in cursor]
 
-        rows = [to_json_safe(doc) async for doc in cursor]
+        rows = await resilient_call(f"mongo_tool:{self.name}", _run_query)
         return {"row_count": len(rows), "rows": rows}

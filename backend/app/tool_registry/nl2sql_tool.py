@@ -38,6 +38,7 @@ from sqlglot import exp
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from app.reliability.resilient_call import resilient_call
 from app.tool_registry.base import ConfigDrivenTool
 from app.tool_registry.data_query_tool import _forbidden_function_call
 from app.tool_registry.serialize import to_json_safe
@@ -79,21 +80,24 @@ class DbSchemaTool(ConfigDrivenTool):
         engine = _get_engine(connection_url)
         allowed_tables: list[str] = self._config["allowed_tables"]
 
-        tables_info = []
-        async with engine.connect() as conn:
-            for qualified in allowed_tables:
-                schema_name, table_name = qualified.split(".") if "." in qualified else ("public", qualified)
-                result = await conn.execute(
-                    text(
-                        "SELECT column_name, data_type FROM information_schema.columns "
-                        "WHERE table_schema = :schema AND table_name = :table "
-                        "ORDER BY ordinal_position"
-                    ),
-                    {"schema": schema_name, "table": table_name},
-                )
-                columns = [{"column": r.column_name, "type": r.data_type} for r in result.fetchall()]
-                tables_info.append({"table": qualified, "columns": columns})
+        async def _load_schema() -> list[dict]:
+            tables_info = []
+            async with engine.connect() as conn:
+                for qualified in allowed_tables:
+                    schema_name, table_name = qualified.split(".") if "." in qualified else ("public", qualified)
+                    result = await conn.execute(
+                        text(
+                            "SELECT column_name, data_type FROM information_schema.columns "
+                            "WHERE table_schema = :schema AND table_name = :table "
+                            "ORDER BY ordinal_position"
+                        ),
+                        {"schema": schema_name, "table": table_name},
+                    )
+                    columns = [{"column": r.column_name, "type": r.data_type} for r in result.fetchall()]
+                    tables_info.append({"table": qualified, "columns": columns})
+            return tables_info
 
+        tables_info = await resilient_call(f"nl2sql_schema:{self.name}", _load_schema)
         return {"tables": tables_info}
 
 
@@ -196,12 +200,16 @@ class Nl2SqlQueryTool(ConfigDrivenTool):
         connection_url = os.environ[self._config["connection_env"]]
         engine = _get_engine(connection_url)
 
-        try:
+        async def _run_query() -> list[dict]:
             async with engine.connect() as conn:
                 await conn.execute(text("SET TRANSACTION READ ONLY"))
                 result = await conn.execute(text(final_sql))
                 rows = [to_json_safe(dict(row._mapping)) for row in result.fetchall()[:max_rows]]
                 await conn.rollback()
+            return rows
+
+        try:
+            rows = await resilient_call(f"nl2sql_query:{self.name}", _run_query)
         except Exception as exc:
             return {"error": f"Query failed: {exc}"}
 

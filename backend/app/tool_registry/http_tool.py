@@ -4,6 +4,7 @@ from typing import Any
 
 import httpx
 
+from app.reliability.resilient_call import resilient_call
 from app.tool_registry.base import ConfigDrivenTool
 
 _PATH_PARAM_RE = re.compile(r"\{(\w+)\}")
@@ -64,11 +65,13 @@ class HttpTool(ConfigDrivenTool):
 
         timeout = config.get("timeout_seconds", 10)
 
-        async with httpx.AsyncClient(timeout=timeout, transport=self._transport) as client:
-            if method in ("GET", "DELETE"):
-                response = await client.request(method, url, params=remaining, headers=headers)
-            else:
-                response = await client.request(method, url, json=remaining, headers=headers)
+        async def _do_request() -> httpx.Response:
+            async with httpx.AsyncClient(timeout=timeout, transport=self._transport) as client:
+                if method in ("GET", "DELETE"):
+                    return await client.request(method, url, params=remaining, headers=headers)
+                return await client.request(method, url, json=remaining, headers=headers)
+
+        response = await resilient_call(f"http_tool:{self.name}", _do_request, timeout_seconds=timeout)
 
         try:
             body: Any = response.json()

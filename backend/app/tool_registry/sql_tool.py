@@ -4,6 +4,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from app.reliability.resilient_call import resilient_call
 from app.tool_registry.base import ConfigDrivenTool
 from app.tool_registry.serialize import to_json_safe
 
@@ -41,8 +42,10 @@ class SqlTool(ConfigDrivenTool):
         engine = _get_engine(connection_url)
         query = text(self._config["query_template"])
 
-        async with engine.connect() as conn:
-            result = await conn.execute(query, args)
-            rows = [to_json_safe(dict(row._mapping)) for row in result.fetchall()]
+        async def _run_query() -> list[dict]:
+            async with engine.connect() as conn:
+                result = await conn.execute(query, args)
+                return [to_json_safe(dict(row._mapping)) for row in result.fetchall()]
 
+        rows = await resilient_call(f"sql_tool:{self.name}", _run_query)
         return {"row_count": len(rows), "rows": rows}

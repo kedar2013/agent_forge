@@ -15,6 +15,7 @@ import {
   Receipt,
   Rocket,
   Search,
+  ShieldAlert,
   ShieldCheck,
   Sparkles,
   UserCog,
@@ -62,6 +63,7 @@ const observeItems: NavItem[] = [
   { to: '/audit', label: 'Audit', icon: FileClock, end: false, roles: ['admin', 'viewer'] },
   { to: '/debug', label: 'Debug Console', icon: Bug, end: false, roles: ['admin', 'viewer', 'developer'] },
   { to: '/scil', label: 'SCIL', icon: DatabaseZap, end: false, roles: ['admin', 'developer'] },
+  { to: '/reliability', label: 'Reliability', icon: ShieldAlert, end: false, roles: ['admin'] },
 ]
 
 const ROLE_LABEL: Record<AdminShellRole, string> = { admin: 'Admin', viewer: 'Viewer', developer: 'Developer' }

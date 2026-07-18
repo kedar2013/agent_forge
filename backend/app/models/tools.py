@@ -27,6 +27,10 @@ TOOL_TYPES = (
     # self_healing_sql_tool writes to when called with `scratchpad_slot` —
     # see app/tool_registry/read_scratchpad_tool.py.
     "read_scratchpad_tool",
+    # Saga/compensation worked example (reserve/release/confirm modes over a
+    # tiny demo inventory table) — see app/tool_registry/reservation_demo_tool.py
+    # and scripts/seed_reliability_demo.py.
+    "reservation_demo_tool",
 )
 
 

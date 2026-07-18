@@ -6,6 +6,7 @@ from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from google.adk.agents import Agent as AdkAgent
+from google.adk.apps.app import App, ResumabilityConfig
 from google.adk.runners import Runner
 from google.adk.sessions import BaseSessionService, DatabaseSessionService, InMemorySessionService
 from google.genai import types
@@ -14,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.db import get_db
-from app.logging_hooks import log_invocation_fire_and_forget
+from app.logging_hooks import log_invocation_fire_and_forget, set_durable_attempt, start_durable_run
 from app.models.agents import Agent as AgentRow
 from app.agent_runtime.builder import close_agent_toolsets, get_or_build_agent
 from app.agent_runtime.byok import required_providers, resolve_request_api_keys, use_api_keys
@@ -23,6 +24,8 @@ from app.observability.rca import cap_payload, classify_error, tool_call_error
 from app.observability.tracing import get_tracer
 from app.principal import Principal, require_role
 from app.rate_limit import rate_limit_principal
+from app.reliability.compensation import run_compensations
+from app.reliability.durable_execution_config import get_durable_execution_config
 from app.scil.corrector import build_correction_message, lookup_known_correction, save_correction_fire_and_forget
 from app.scil.entities import remember_entities_fire_and_forget, resolve_entity_mismatch
 from app.scil.eval_runner import sample_groundedness_fire_and_forget
@@ -159,8 +162,10 @@ async def _execute_run(
     app_name: str,
     user_id: str,
     session_id: str,
-    message: str,
+    message: str | None,
     state_delta: dict[str, Any] | None,
+    invocation_id: str | None = None,
+    resumable: bool = False,
 ) -> _RunOutcome:
     """Runs one turn and collects its outcome. Split out from `_run_turn` so a
     stale-session failure (see below) can retry this in isolation.
@@ -176,8 +181,24 @@ async def _execute_run(
     transfers are recorded as `events`, not spans — they're instantaneous
     hand-offs, not something with its own duration. With tracing disabled
     (default), `get_tracer()` returns a no-op tracer and all of this costs
-    effectively nothing."""
-    runner = Runner(agent=adk_agent, app_name=app_name, session_service=session_service)
+    effectively nothing.
+
+    `invocation_id`/`resumable` are only ever set by durable-execution-
+    enabled turns (see `_run_turn`'s `use_durable`): `invocation_id` is the
+    ADK invocation id this specific attempt should run/resume under (see
+    `app.logging_hooks.set_durable_attempt`), and `resumable=True` builds
+    the `Runner` with ADK's own experimental resumability
+    (`google.adk.apps.app.ResumabilityConfig`) turned on — required for a
+    later call with `message=None` to resume this exact invocation instead
+    of starting a new one. `message=None` is only ever used by that resume
+    path; every normal call passes a real message."""
+    if resumable:
+        runner = Runner(
+            app=App(name=app_name, root_agent=adk_agent, resumability_config=ResumabilityConfig(is_resumable=True)),
+            session_service=session_service,
+        )
+    else:
+        runner = Runner(agent=adk_agent, app_name=app_name, session_service=session_service)
     outcome = _RunOutcome()
     pending_calls: dict[str, dict[str, Any]] = {}
     run_start = time.monotonic()
@@ -192,11 +213,15 @@ async def _execute_run(
         # have an all-zero, `is_valid=False` context; don't persist that as if
         # it were a real trace id.
         outcome.otel_trace_id = format(span_context.trace_id, "032x") if span_context.is_valid else None
+        new_message = (
+            types.Content(role="user", parts=[types.Part.from_text(text=message)]) if message is not None else None
+        )
         try:
             async for event in runner.run_async(
                 user_id=user_id,
                 session_id=session_id,
-                new_message=types.Content(role="user", parts=[types.Part.from_text(text=message)]),
+                invocation_id=invocation_id,
+                new_message=new_message,
                 state_delta=state_delta,
             ):
                 # Tracks whichever agent authored the most recent event — for a
@@ -285,11 +310,20 @@ async def _execute_run(
                     )
 
                 if event.content and event.content.parts:
-                    event_text_parts = [part.text for part in event.content.parts if part.text]
+                    # Planner-enabled agents (see agent_runtime/planning_config.py)
+                    # mark their /*PLANNING*/.../*ACTION*/... scaffolding as
+                    # part.thought=True (ADK's own flows/llm_flows/_nl_planning.py) —
+                    # split those out so raw ReAct tags never reach the user-facing
+                    # answer, while still keeping them visible to the Debug Console
+                    # as a model_text event (reasoning=True). Every agent that
+                    # doesn't use a planner never sets .thought, so this is a no-op
+                    # for the rest of the platform.
+                    model_agent = event.author or outcome.last_author or adk_agent.name
+                    event_text_parts = [part.text for part in event.content.parts if part.text and not part.thought]
+                    reasoning_parts = [part.text for part in event.content.parts if part.text and part.thought]
                     if event_text_parts:
                         outcome.final_text_parts.extend(event_text_parts)
                         model_text = "".join(event_text_parts)
-                        model_agent = event.author or outcome.last_author or adk_agent.name
                         msg_span = tracer.start_span(
                             "agent.message",
                             attributes={"agent.name": model_agent, "message.text": model_text[:4000]},
@@ -300,6 +334,16 @@ async def _execute_run(
                                 "event_type": "model_text",
                                 "from_agent": model_agent,
                                 "detail": {"text": model_text},
+                                "offset_ms": int((time.monotonic() - run_start) * 1000),
+                                "sequence": len(outcome.events),
+                            }
+                        )
+                    if reasoning_parts:
+                        outcome.events.append(
+                            {
+                                "event_type": "model_text",
+                                "from_agent": model_agent,
+                                "detail": {"text": "".join(reasoning_parts), "reasoning": True},
                                 "offset_ms": int((time.monotonic() - run_start) * 1000),
                                 "sequence": len(outcome.events),
                             }
@@ -531,11 +575,15 @@ async def _stream_turn(
                     }
 
                 if event.content and event.content.parts:
-                    event_text_parts = [part.text for part in event.content.parts if part.text]
+                    # See _execute_run's matching block for why .thought is
+                    # filtered out here too — same planner scaffolding leak
+                    # would otherwise happen on the streaming chat path.
+                    model_agent = event.author or last_author or adk_agent.name
+                    event_text_parts = [part.text for part in event.content.parts if part.text and not part.thought]
+                    reasoning_parts = [part.text for part in event.content.parts if part.text and part.thought]
                     if event_text_parts:
                         final_text_parts.extend(event_text_parts)
                         model_text = "".join(event_text_parts)
-                        model_agent = event.author or last_author or adk_agent.name
                         msg_span = tracer.start_span(
                             "agent.message",
                             attributes={"agent.name": model_agent, "message.text": model_text[:4000]},
@@ -546,6 +594,16 @@ async def _stream_turn(
                                 "event_type": "model_text",
                                 "from_agent": model_agent,
                                 "detail": {"text": model_text},
+                                "offset_ms": int((time.monotonic() - start) * 1000),
+                                "sequence": len(events),
+                            }
+                        )
+                    if reasoning_parts:
+                        events.append(
+                            {
+                                "event_type": "model_text",
+                                "from_agent": model_agent,
+                                "detail": {"text": "".join(reasoning_parts), "reasoning": True},
                                 "offset_ms": int((time.monotonic() - start) * 1000),
                                 "sequence": len(events),
                             }
@@ -648,6 +706,7 @@ async def _run_turn(
     session_id: str,
     message: str,
     state_delta: dict[str, Any] | None,
+    use_durable: bool = False,
 ) -> PlaygroundRunResponse:
     # SCIL short-circuits -- see the matching block in _stream_turn for the
     # full rationale. Order: template match (pure regex, cheapest) -> cache
@@ -655,6 +714,45 @@ async def _run_turn(
     scil_request_id = uuid.uuid4()
     scil_start = time.monotonic()
     scil_config = get_scil_config(agent_row)
+
+    # Durable execution (see app/reliability/): an eager 'running' row lets a
+    # crash mid-turn leave a resumable trace instead of no row at all — see
+    # POST /reliability/runs/{id}/resume. use_durable is decided by the
+    # caller (this agent opted in AND the session is DB-backed, never true
+    # for the Playground's InMemorySessionService).
+    invocation_log_id: uuid.UUID | None = None
+    if use_durable:
+        invocation_log_id = await start_durable_run(
+            agent_id=agent_row.id,
+            agent_version=agent_row.current_version,
+            workspace_id=agent_row.workspace_id,
+            adk_session_id=session_id,
+            adk_user_id=user_id,
+            adk_app_name=app_name,
+            invoked_by=user_id,
+        )
+
+    async def _run_attempt(attempt_message: str) -> "_RunOutcome":
+        """Every _execute_run(...) call this turn makes (the initial
+        attempt, and any stale-session/hallucination/SCIL retry below) goes
+        through here so each one gets its own fresh ADK invocation id,
+        durably pointed at by invocation_log_id before it runs — whichever
+        attempt is CURRENTLY live is always the one a resume would continue."""
+        adk_invocation_id = None
+        if use_durable:
+            adk_invocation_id = str(uuid.uuid4())
+            await set_durable_attempt(invocation_log_id, adk_invocation_id)
+        return await _execute_run(
+            adk_agent=adk_agent,
+            session_service=session_service,
+            app_name=app_name,
+            user_id=user_id,
+            session_id=session_id,
+            message=attempt_message,
+            state_delta=state_delta,
+            invocation_id=adk_invocation_id,
+            resumable=use_durable,
+        )
 
     template_answer = check_template(normalize(message), scil_config)
     if template_answer is not None:
@@ -703,15 +801,7 @@ async def _run_turn(
         )
 
     start = time.monotonic()
-    outcome = await _execute_run(
-        adk_agent=adk_agent,
-        session_service=session_service,
-        app_name=app_name,
-        user_id=user_id,
-        session_id=session_id,
-        message=llm_message,
-        state_delta=state_delta,
-    )
+    outcome = await _run_attempt(llm_message)
     # Accumulated across every attempt (including ones later superseded by a
     # retry) so RCA can see the FAILED attempt's tool calls/transfers too —
     # not just the final, possibly-successful one. `outcome` itself gets
@@ -748,15 +838,7 @@ async def _run_turn(
         await session_service.create_session(
             app_name=app_name, user_id=user_id, session_id=session_id, state=state_delta
         )
-        outcome = await _execute_run(
-            adk_agent=adk_agent,
-            session_service=session_service,
-            app_name=app_name,
-            user_id=user_id,
-            session_id=session_id,
-            message=llm_message,
-            state_delta=state_delta,
-        )
+        outcome = await _run_attempt(llm_message)
         all_tool_call_records += outcome.tool_call_records
         all_events += outcome.events
     elif is_tool_hallucination_error:
@@ -778,15 +860,7 @@ async def _run_turn(
                 "sequence": len(all_events),
             }
         )
-        outcome = await _execute_run(
-            adk_agent=adk_agent,
-            session_service=session_service,
-            app_name=app_name,
-            user_id=user_id,
-            session_id=session_id,
-            message=llm_message,
-            state_delta=state_delta,
-        )
+        outcome = await _run_attempt(llm_message)
         all_tool_call_records += outcome.tool_call_records
         all_events += outcome.events
 
@@ -841,15 +915,7 @@ async def _run_turn(
                 known_correction=known_correction,
             )
             scil_retries += 1
-            outcome = await _execute_run(
-                adk_agent=adk_agent,
-                session_service=session_service,
-                app_name=app_name,
-                user_id=user_id,
-                session_id=session_id,
-                message=correction_message,
-                state_delta=state_delta,
-            )
+            outcome = await _run_attempt(correction_message)
             all_tool_call_records += outcome.tool_call_records
             all_events += outcome.events
             if outcome.status != "success":
@@ -910,6 +976,7 @@ async def _run_turn(
     )
 
     log_invocation_fire_and_forget(
+        invocation_log_id=invocation_log_id,
         agent_id=agent_row.id,
         agent_version=agent_row.current_version,
         workspace_id=agent_row.workspace_id,
@@ -924,7 +991,12 @@ async def _run_turn(
         error_message=outcome.error_message,
         invoked_by=user_id,
         transcript={"message": message, "response_text": response_text},
-        tool_calls=all_tool_call_records,
+        # Durable-execution turns already have their ToolCallLog rows,
+        # written synchronously per-call by builder.py's after_tool
+        # callback — passing all_tool_call_records here too would insert
+        # duplicates. events (transfers/model text) still batch as before;
+        # see the plan's scoping note on why only tool calls are incremental.
+        tool_calls=None if use_durable else all_tool_call_records,
         events=all_events,
         resolved_author=outcome.last_author,
     )
@@ -973,6 +1045,15 @@ async def _run_turn(
         )
 
     if outcome.status == "error":
+        if use_durable:
+            # Saga/compensation: this turn's already-succeeded steps (each
+            # durably recorded — see builder.py's after_tool callback) may
+            # have real side effects that need rolling back now that the
+            # turn as a whole failed. Awaited, not fire-and-forget: this
+            # response is already an error, so the extra latency is an
+            # acceptable price for actually knowing compensation ran before
+            # the caller acts on the failure.
+            await run_compensations(invocation_log_id)
         raise HTTPException(status_code=502, detail=f"Run failed: {outcome.error_message}")
 
     return PlaygroundRunResponse(
@@ -1051,7 +1132,13 @@ async def invoke_published_agent(
     if agent_row.status != "published":
         raise HTTPException(status_code=409, detail="Agent has no published version")
 
-    adk_agent = await get_or_build_agent(db, agent_id, version=agent_row.current_version)
+    # /invoke is always DB-backed (_invoke_sessions), so this agent's own
+    # opt-in is the only gate — unlike Playground, which is never eligible
+    # regardless of config (see run_playground above).
+    use_durable = get_durable_execution_config(agent_row).enabled
+    adk_agent = await get_or_build_agent(
+        db, agent_id, version=agent_row.current_version, durable_execution_enabled=use_durable
+    )
     user_id = payload.user_id or "external-caller"
     session_id = payload.session_id or f"invoke-{uuid.uuid4()}"
 
@@ -1073,4 +1160,5 @@ async def invoke_published_agent(
             session_id=session_id,
             message=payload.message,
             state_delta=payload.state_delta,
+            use_durable=use_durable,
         )

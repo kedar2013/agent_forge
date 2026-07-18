@@ -21,6 +21,7 @@ from app.models.logs import InvocationLog
 from app.playground_api.router import _run_turn, _stream_turn
 from app.principal import Principal
 from app.rate_limit import rate_limit_principal
+from app.reliability.durable_execution_config import get_durable_execution_config
 from app.schemas.dashboards import MyUsageAgentRow, MyUsageDayPoint, MyUsageSummary
 from app.schemas.playground import PlaygroundRunResponse
 
@@ -33,8 +34,11 @@ _chat_sessions = DatabaseSessionService(db_url=get_settings().database_url)
 # Fallback when a request doesn't name an orchestrator explicitly — keeps
 # existing callers (and the pre-picker frontend) working unchanged. See
 # list_chat_orchestrators() below for how a client discovers every bot it
-# can actually pick.
-CHATBOT_AGENT_NAME = "market_intelligence_orchestrator"
+# can actually pick. market_intelligence_orchestrator was renamed to
+# agent_forge_orchestrator by scripts/consolidate_orchestrators.py, which
+# also archived every other orchestrator-shaped agent — this is now the
+# only one, so it's also the only sane default.
+CHATBOT_AGENT_NAME = "agent_forge_orchestrator"
 
 
 def _principal_key(principal: Principal) -> str:
@@ -180,7 +184,15 @@ async def send_chat_message(
     x_anthropic_api_key: str | None = Header(default=None, alias="X-Anthropic-Api-Key"),
 ) -> PlaygroundRunResponse:
     agent_row = await _resolve_chat_agent(db, principal, payload.agent_name)
-    adk_agent = await get_or_build_agent(db, agent_row.id, version=agent_row.current_version)
+    # /chat/message (blocking) is always DB-backed (_chat_sessions), so this
+    # agent's own opt-in is the only gate. The streaming twin below
+    # (/chat/message/stream) deliberately does NOT get durable execution in
+    # this pass — it already has its own "simpler, no retry layer" precedent
+    # (see _stream_turn's docstring) that this follows.
+    use_durable = get_durable_execution_config(agent_row).enabled
+    adk_agent = await get_or_build_agent(
+        db, agent_row.id, version=agent_row.current_version, durable_execution_enabled=use_durable
+    )
     user_key = _principal_key(principal)
     session_id = payload.session_id or f"chat-{user_key}-{uuid.uuid4()}"
     await _ensure_session_state("agent_forge_chat", user_key, session_id, principal)
@@ -203,6 +215,7 @@ async def send_chat_message(
             session_id=session_id,
             message=payload.message,
             state_delta={**(payload.state_delta or {}), **_identity_state_delta(principal)},
+            use_durable=use_durable,
         )
 
 

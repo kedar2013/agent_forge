@@ -9,6 +9,7 @@ from app.tool_registry.mongo_tool import MongoQueryTool
 from app.tool_registry.mysql_tool import MySQLQueryTool
 from app.tool_registry.nl2sql_tool import DbSchemaTool, Nl2SqlQueryTool
 from app.tool_registry.read_scratchpad_tool import ReadScratchpadTool
+from app.tool_registry.reservation_demo_tool import ReservationDemoTool
 from app.tool_registry.retrieval_tool import RetrievalTool
 from app.tool_registry.self_healing_sql_tool import SelfHealingSqlTool
 from app.tool_registry.sql_tool import SqlTool
@@ -95,6 +96,13 @@ def build_tool(tool: Tool) -> Any:
         )
     if tool.tool_type == "read_scratchpad_tool":
         return ReadScratchpadTool(
+            name=tool.name,
+            description=tool.description or tool.name,
+            input_schema=tool.input_schema,
+            config=tool.config,
+        )
+    if tool.tool_type == "reservation_demo_tool":
+        return ReservationDemoTool(
             name=tool.name,
             description=tool.description or tool.name,
             input_schema=tool.input_schema,

@@ -1,14 +1,34 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, func
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
 
-INVOCATION_STATUSES = ("success", "error", "timeout")
+# "running" is only ever written by durable-execution-enabled agents (see
+# app/playground_api/router.py) — it marks a turn whose InvocationLog row was
+# inserted eagerly, at turn start, so a crash mid-turn leaves a visible,
+# resumable trace instead of no row at all. Every other agent never produces
+# a "running" row: their InvocationLog is still written exactly once, at the
+# end, exactly as before.
+INVOCATION_STATUSES = ("success", "error", "timeout", "running")
 TOOL_CALL_STATUSES = ("success", "error")
+COMPENSATION_STATUSES = ("pending", "compensated", "failed")
 AUDIT_ENTITY_TYPES = ("agent", "tool", "skill", "access_policy", "data_entity")
 AUDIT_ACTIONS = ("create", "update", "publish", "archive", "delete")
 # "transfer" = agent-to-agent handoff (ADK's transfer_to_agent). The two
@@ -39,6 +59,7 @@ class InvocationLog(Base):
         CheckConstraint(f"status IN {INVOCATION_STATUSES}", name="invocation_log_status_check"),
         Index("ix_invocation_log_agent_id_created_at", "agent_id", "created_at"),
         Index("ix_invocation_log_workspace_id_created_at", "workspace_id", "created_at"),
+        Index("ix_invocation_log_adk_invocation_id", "adk_invocation_id", unique=True),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -50,6 +71,22 @@ class InvocationLog(Base):
     # invocation, distinct from `trace_id` above (which is the ADK session_id)
     # — this is what correlates a row here to a trace in Jaeger/Langfuse/etc.
     otel_trace_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The three columns below are only populated for durable-execution-enabled
+    # agents (model_config.durable_execution.enabled) — NULL for every other
+    # agent, exactly preserving today's behavior for the common case.
+    # adk_invocation_id is the ADK invocation id of whichever attempt is
+    # CURRENTLY live (the initial attempt, or the most recent SCIL retry) —
+    # overwritten on each retry, so it always points at the one to resume if
+    # the process dies. adk_session_id/adk_user_id are what a resume needs to
+    # call runner.run_async(user_id=..., session_id=..., invocation_id=...,
+    # new_message=None) against the same ADK session.
+    adk_invocation_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    adk_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    adk_user_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # "agent_forge_invoke" or "agent_forge_chat" — ADK session storage is
+    # scoped by (app_name, user_id, session_id), so a resume needs this to
+    # find the right session, not just the session_id.
+    adk_app_name: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False)
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -74,7 +111,12 @@ class ToolCallLog(Base):
     __tablename__ = "tool_call_log"
     __table_args__ = (
         CheckConstraint(f"status IN {TOOL_CALL_STATUSES}", name="tool_call_log_status_check"),
+        CheckConstraint(
+            f"compensation_status IS NULL OR compensation_status IN {COMPENSATION_STATUSES}",
+            name="tool_call_log_compensation_status_check",
+        ),
         Index("ix_tool_call_log_tool_id_created_at", "tool_id", "created_at"),
+        UniqueConstraint("invocation_id", "idempotency_key", name="uq_tool_call_log_invocation_idempotency_key"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -106,6 +148,21 @@ class ToolCallLog(Base):
     # {"_truncated": true, "preview": "..."} rather than silently dropped.
     input: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     output: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Durable-execution fields (see InvocationLog above) — NULL/false for
+    # every non-opted-in agent. idempotency_key is
+    # f"{adk_invocation_id}:{function_call_id}" (both ADK-assigned, see
+    # app/agent_runtime/builder.py's _before_tool/_after_tool callbacks): a
+    # resume that re-attempts the one tool call ADK only guarantees
+    # at-least-once for finds this row and skips real execution instead of
+    # re-running a possibly-expensive or side-effecting call. `replayed`
+    # records that a resume served this row's cached output rather than
+    # executing for real.
+    idempotency_key: Mapped[str | None] = mapped_column(String, nullable=True)
+    replayed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Set when this call's tool has a configured compensation_tool_id
+    # (tools.config) and the turn it belonged to ultimately failed — see
+    # the saga/compensation walk in playground_api/router.py.
+    compensation_status: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

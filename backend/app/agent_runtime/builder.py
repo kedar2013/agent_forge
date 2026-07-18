@@ -3,17 +3,23 @@ import uuid
 
 from google.adk.agents import Agent as AdkAgent
 from google.adk.models.lite_llm import LiteLlm
+from google.adk.planners import PlanReActPlanner
 from google.adk.tools.base_toolset import BaseToolset
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.byok import ContextAwareLiteLLMClient
 from app.agent_runtime.cache import agent_cache
+from app.agent_runtime.planning_config import get_planning_config
 from app.agent_runtime.schema_utils import build_output_schema_model
+from app.db import async_session_factory
 from app.models.access_policies import AccessPolicy
 from app.models.agents import Agent, AgentSkill, AgentSubagent, AgentTool, AgentVersion
+from app.models.logs import InvocationLog, ToolCallLog
 from app.models.skills import Skill
 from app.models.tools import Tool
+from app.observability.rca import cap_payload, tool_call_error
 from app.tool_registry.factory import build_tool
 from app.tool_registry.policy_engine import ScopeResolution, apply_policy, resolve_scope
 
@@ -45,7 +51,35 @@ async def _load_policies(
 _MAX_TRANSFERS_PER_TURN = 8
 
 
-def _build_before_tool_callback(tools_rows: list[Tool], policies_by_id: dict[str, AccessPolicy]):
+async def _resolve_durable_invocation_id(tool_context) -> uuid.UUID | None:
+    """Looks up the Agent Forge `InvocationLog` row this ADK invocation_id
+    belongs to — set eagerly by `app.logging_hooks.start_durable_run` before
+    the turn's first `runner.run_async()` call (see
+    `playground_api/router.py`'s `_run_turn`) — or None if this turn never
+    got a durable checkpoint row (every agent that hasn't opted into
+    `model_config.durable_execution`, plus Playground runs even when it has,
+    since Playground's InMemorySessionService has nothing to resume).
+    Cached on `tool_context.state` so a multi-tool-call turn pays for this
+    lookup once, not once per tool call — `tool_context.state` is reset on
+    resume (ADK's own resumability contract: "any temporary/in-memory state
+    will be lost upon resumption"), which is fine, it just means one extra
+    lookup on the first tool call after a resume."""
+    cache_key = f"_durable_invocation_log_id:{tool_context.invocation_id}"
+    if cache_key in tool_context.state:
+        cached = tool_context.state[cache_key]
+        return uuid.UUID(cached) if cached else None
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(InvocationLog.id).where(InvocationLog.adk_invocation_id == tool_context.invocation_id)
+        )
+        row_id = result.scalar_one_or_none()
+    tool_context.state[cache_key] = str(row_id) if row_id else ""
+    return row_id
+
+
+def _build_before_tool_callback(
+    tools_rows: list[Tool], policies_by_id: dict[str, AccessPolicy], durable_execution_enabled: bool = False
+):
     """One callback, registered on every agent this platform builds, that
     generically (a) caps how many agent-to-agent hand-offs can happen in a
     single turn (see _MAX_TRANSFERS_PER_TURN above) — applies to every
@@ -56,9 +90,17 @@ def _build_before_tool_callback(tools_rows: list[Tool], policies_by_id: dict[str
     caller's principal id) into any tool whose config lists them under
     `context_params`; and (c) for any tool whose config carries a
     `policy_id`, mechanically enforces that `AccessPolicy`'s row-level
-    filter — or denies the call outright — before the tool ever runs.
+    filter — or denies the call outright — before the tool ever runs; and
+    (d), when `durable_execution_enabled` (this turn opted into
+    `model_config.durable_execution` AND is running on a durable session —
+    see `_run_turn`), checks whether this exact tool-call attempt was
+    already durably recorded by a prior, crashed run of this same
+    invocation — if so, returns its cached output directly instead of
+    re-executing, closing the one gap ADK's own resumability explicitly
+    disclaims ("tool call to resume needs to be idempotent because we only
+    guarantee at-least-once behavior once resumed").
 
-    None of these three are specific to any one tool type or domain: a
+    None of these four are specific to any one tool type or domain: a
     future domain/orchestrator opts in purely through its own config (or,
     for the hop cap, simply by existing) — no code here changes.
     """
@@ -83,6 +125,25 @@ def _build_before_tool_callback(tools_rows: list[Tool], policies_by_id: dict[str
                         "gathered, noting plainly anything you weren't able to resolve."
                     )
                 }
+        elif durable_execution_enabled and tool_context.function_call_id:
+            invocation_log_id = await _resolve_durable_invocation_id(tool_context)
+            if invocation_log_id is not None:
+                idempotency_key = f"{tool_context.invocation_id}:{tool_context.function_call_id}"
+                async with async_session_factory() as session:
+                    result = await session.execute(
+                        select(ToolCallLog.output).where(
+                            ToolCallLog.invocation_id == invocation_log_id,
+                            ToolCallLog.idempotency_key == idempotency_key,
+                            ToolCallLog.status == "success",
+                        )
+                    )
+                    cached_output = result.scalar_one_or_none()
+                # A resume re-attempting the one tool call ADK only
+                # guarantees at-least-once for finds it already succeeded
+                # here and skips real execution — the actual output was
+                # already durably written by _after_tool before the crash.
+                if cached_output is not None:
+                    return cached_output
 
         mapping = context_params_by_tool.get(tool.name)
         if mapping:
@@ -130,6 +191,62 @@ def _build_before_tool_callback(tools_rows: list[Tool], policies_by_id: dict[str
         return None
 
     return _before_tool
+
+
+def _build_after_tool_callback(tools_rows: list[Tool], durable_execution_enabled: bool = False):
+    """Counterpart to `_build_before_tool_callback`'s durable-execution
+    branch: on every REAL (non-replayed) tool execution, synchronously
+    (awaited, not fire-and-forget — durability is the entire point) writes
+    one `ToolCallLog` row keyed by this exact attempt's idempotency key, so
+    a later resume's `_before_tool` lookup can find it. A no-op whenever
+    durable execution isn't enabled for this turn, or this turn never got a
+    durable checkpoint row in the first place (e.g. Playground) — same cost
+    as today (zero) for every agent that hasn't opted in.
+
+    `tool_id` is resolved by name against this agent's own `tools_rows`
+    (already loaded once at build time, same as `context_params_by_tool`/
+    `policy_by_tool` above) rather than a second query per call.
+    """
+    tool_id_by_name = {t.name: t.id for t in tools_rows}
+
+    async def _after_tool(tool, args, tool_context, tool_response):
+        if not durable_execution_enabled or tool.name == "transfer_to_agent" or not tool_context.function_call_id:
+            return None
+
+        invocation_log_id = await _resolve_durable_invocation_id(tool_context)
+        if invocation_log_id is None:
+            return None
+
+        idempotency_key = f"{tool_context.invocation_id}:{tool_context.function_call_id}"
+        counter_key = f"_durable_call_index:{tool_context.invocation_id}"
+        call_index = tool_context.state.get(counter_key, 0)
+        tool_context.state[counter_key] = call_index + 1
+        error = tool_call_error(tool_response)
+
+        async with async_session_factory() as session:
+            session.add(
+                ToolCallLog(
+                    invocation_id=invocation_log_id,
+                    tool_id=tool_id_by_name.get(tool.name),
+                    call_index=call_index,
+                    status="error" if error else "success",
+                    latency_ms=0,
+                    error_message=error,
+                    input=cap_payload(args),
+                    output=cap_payload(tool_response),
+                    idempotency_key=idempotency_key,
+                )
+            )
+            try:
+                await session.commit()
+            except IntegrityError:
+                # Already durably recorded — the unique (invocation_id,
+                # idempotency_key) constraint makes a duplicate write here a
+                # harmless no-op, not a real conflict.
+                await session.rollback()
+        return None
+
+    return _after_tool
 
 
 def _resolve_model(model: str) -> str | LiteLlm:
@@ -197,7 +314,11 @@ async def _load_live_subagent_ids(db: AsyncSession, agent_id: uuid.UUID) -> list
 
 
 async def _build_from_live_config(
-    db: AsyncSession, agent_id: uuid.UUID, _building: set[uuid.UUID], workspace_id: uuid.UUID | None = None
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    _building: set[uuid.UUID],
+    workspace_id: uuid.UUID | None = None,
+    durable_execution_enabled: bool = False,
 ) -> AdkAgent:
     agent = await db.get(Agent, agent_id)
     if agent is None:
@@ -218,7 +339,8 @@ async def _build_from_live_config(
 
     tools: list = [build_tool(t) for t in tools_rows]
     policies_by_id = await _load_policies(db, tools_rows, workspace_id)
-    before_tool_callback = _build_before_tool_callback(tools_rows, policies_by_id)
+    before_tool_callback = _build_before_tool_callback(tools_rows, policies_by_id, durable_execution_enabled)
+    after_tool_callback = _build_after_tool_callback(tools_rows, durable_execution_enabled)
 
     sub_agents: list[AdkAgent] = []
     for child_id in subagent_ids:
@@ -227,7 +349,11 @@ async def _build_from_live_config(
         child_row = await db.get(Agent, child_id)
         if child_row is None or child_row.workspace_id != workspace_id:
             continue  # missing or cross-tenant — excluded silently, not a hard failure
-        sub_agents.append(await _build_from_live_config(db, child_id, _building | {agent_id}, workspace_id))
+        sub_agents.append(
+            await _build_from_live_config(
+                db, child_id, _building | {agent_id}, workspace_id, durable_execution_enabled
+            )
+        )
 
     return AdkAgent(
         name=_safe_agent_name(agent.name),
@@ -237,8 +363,16 @@ async def _build_from_live_config(
         tools=tools,
         sub_agents=sub_agents,
         before_tool_callback=before_tool_callback,
+        after_tool_callback=after_tool_callback,
         output_schema=build_output_schema_model(agent.output_schema),
         output_key=agent.output_key,
+        # Decided per-node from this agent's OWN model_config, not inherited
+        # from a parent/root the way durable_execution is — Planner/ReAct is
+        # a property of how one agent reasons, not of the whole turn, so
+        # each agent in a tree opts in independently. See
+        # agent_runtime/planning_config.py; ADK's own flows/llm_flows/
+        # _nl_planning.py does the rest whenever `planner` is set.
+        planner=PlanReActPlanner() if get_planning_config(agent).enabled else None,
         # Allowing transfer back to the parent is what lets a specialist that
         # can't help with a message hand back to its orchestrator to re-route
         # — without this, once a session resumes a given specialist (ADK
@@ -250,7 +384,12 @@ async def _build_from_live_config(
 
 
 async def _build_from_snapshot(
-    db: AsyncSession, agent_id: uuid.UUID, version: int, _building: set[uuid.UUID], workspace_id: uuid.UUID | None = None
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    version: int,
+    _building: set[uuid.UUID],
+    workspace_id: uuid.UUID | None = None,
+    durable_execution_enabled: bool = False,
 ) -> AdkAgent:
     agent_row = await db.get(Agent, agent_id)
     if agent_row is None:
@@ -288,7 +427,8 @@ async def _build_from_snapshot(
 
     tools: list = [build_tool(t) for t in tools_rows]
     policies_by_id = await _load_policies(db, tools_rows, workspace_id)
-    before_tool_callback = _build_before_tool_callback(tools_rows, policies_by_id)
+    before_tool_callback = _build_before_tool_callback(tools_rows, policies_by_id, durable_execution_enabled)
+    after_tool_callback = _build_after_tool_callback(tools_rows, durable_execution_enabled)
 
     sub_agents: list[AdkAgent] = []
     for sub in snapshot.get("sub_agents", []):
@@ -303,9 +443,17 @@ async def _build_from_snapshot(
         # a cached (already-parented) instance can't be reused as anyone's
         # child a second time — including the same parent rebuilt after a
         # republish, or a second parent that also attaches this agent.
+        # durable_execution_enabled is inherited from the ROOT agent being
+        # run, not re-derived from each sub-agent's own config — durability
+        # is a property of the whole turn/workflow, decided once.
         sub_agents.append(
             await _build_from_snapshot(
-                db, child_id, child_agent_row.current_version, _building | {agent_id}, workspace_id
+                db,
+                child_id,
+                child_agent_row.current_version,
+                _building | {agent_id},
+                workspace_id,
+                durable_execution_enabled,
             )
         )
 
@@ -317,8 +465,12 @@ async def _build_from_snapshot(
         tools=tools,
         sub_agents=sub_agents,
         before_tool_callback=before_tool_callback,
+        after_tool_callback=after_tool_callback,
         output_schema=build_output_schema_model(snapshot.get("output_schema")),
         output_key=snapshot.get("output_key"),
+        # Same per-node planning opt-in as _build_from_live_config, read from
+        # the frozen snapshot's own model_config here instead of a live row.
+        planner=PlanReActPlanner() if (snapshot["model_config"] or {}).get("planning", {}).get("enabled") else None,
         disallow_transfer_to_parent=False,
     )
 
@@ -333,6 +485,7 @@ async def get_or_build_agent(
     agent_id: uuid.UUID,
     version: int | None,
     _building: set[uuid.UUID] | None = None,
+    durable_execution_enabled: bool = False,
 ) -> AdkAgent:
     """Builds (or returns cached) a `google.adk.agents.Agent` for this config.
 
@@ -340,6 +493,15 @@ async def get_or_build_agent(
     cached — used by the playground, where you're actively iterating.
     version=<int> builds from the frozen `agent_versions.snapshot` and is
     cached until the next publish evicts it.
+
+    `durable_execution_enabled` is baked into the built agent's before/after
+    tool callbacks (see `_build_before_tool_callback`/`_build_after_tool_
+    callback`) — unlike SCIL's config (read fresh on every turn in
+    `_run_turn`, never cached), this one lives inside the cached build
+    itself, so for a published agent (version=<int>) toggling
+    `model_config.durable_execution.enabled` only takes effect on the next
+    publish, same as any other model_config change (instruction, tools,
+    model) — not a gap, just the existing agent_cache contract.
     """
     building = set(_building or ())
 
@@ -347,11 +509,13 @@ async def get_or_build_agent(
         cached = agent_cache.get(agent_id, version)
         if cached is not None:
             return cached
-        built = await _build_from_snapshot(db, agent_id, version, building)
+        built = await _build_from_snapshot(
+            db, agent_id, version, building, durable_execution_enabled=durable_execution_enabled
+        )
         agent_cache.set(agent_id, version, built)
         return built
 
-    return await _build_from_live_config(db, agent_id, building)
+    return await _build_from_live_config(db, agent_id, building, durable_execution_enabled=durable_execution_enabled)
 
 
 async def close_agent_toolsets(agent: AdkAgent) -> None:
