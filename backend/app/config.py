@@ -67,6 +67,116 @@ class Settings(BaseSettings):
     otel_exporter_otlp_endpoint: str = "http://localhost:4317"
     jaeger_query_url: str = "http://localhost:16686"
 
+    # --- Guardrails (see app/guardrails/) -----------------------------------
+    # Platform-wide default for every agent that doesn't set its own
+    # model_config.guardrails.enabled — unlike otel/durable_execution/SCIL,
+    # this defaults ON: guardrails are an operator-owned safety control, not
+    # a per-agent opt-in feature. Set false for local dev if you don't want
+    # the deterministic checks running on every playground turn.
+    guardrails_enabled: bool = True
+    # Master switch for the LLM-judge-based checks (jailbreak/topical-scope
+    # judges) — separate from guardrails_enabled, and OFF by default, unlike
+    # it: those deterministic regex checks (injection heuristics, PII, MNPI)
+    # are free and always run as the safety floor, but a judge check costs a
+    # real extra model call on every single agent turn (every hop, for a
+    # multi-specialist turn) — silently defaulting that on would double
+    # every already-published agent's LLM spend the moment this ships, the
+    # same reason SCIL's hallucination_groundedness_check/durable_execution/
+    # planning are all opt-in elsewhere in this codebase. An operator (or an
+    # individual agent, via model_config.guardrails.input.topical_scope_check)
+    # opts in deliberately once they've budgeted for it.
+    guardrails_judge_enabled: bool = False
+    # Comma-separated platform-wide confidential/MNPI term list, merged with
+    # (not replaced by) each agent's own model_config.guardrails.output.
+    # mnpi_terms. Empty by default — an operator fills this in per their own
+    # compliance list; ships empty rather than with a guessed example list
+    # that would give a false sense of coverage.
+    guardrails_mnpi_terms_raw: str = ""
+
+    @field_validator("guardrails_mnpi_terms_raw")
+    @classmethod
+    def _strip_mnpi_terms(cls, v: str) -> str:
+        return v.strip()
+
+    @property
+    def guardrails_mnpi_terms(self) -> list[str]:
+        return [t.strip() for t in self.guardrails_mnpi_terms_raw.split(",") if t.strip()]
+
+    # --- Policy-as-code / OPA (see app/tool_registry/opa_client.py) --------
+    # Off by default, same "fresh checkout doesn't need extra infra" reasoning
+    # as otel_enabled — the existing in-process policy_engine.apply_policy
+    # stays every AccessPolicy's engine unless it explicitly opts in via
+    # resolver_config["engine"] = "opa" (see backend/policies/*.rego for a
+    # worked example, and scripts/migrate_policy_to_opa.py to switch a named
+    # policy over once a real OPA is reachable). `docker compose up -d opa`
+    # brings up a local one loaded with backend/policies/ in one command.
+    opa_enabled: bool = False
+    opa_url: str = "http://localhost:8181"
+    opa_timeout_seconds: float = 2.0
+    # An OPA-engine policy is still an access-control decision -- unlike a
+    # judge-based guardrail check (where failing open protects a real user
+    # from a broken judge), failing OPEN here means letting a request
+    # through UNFILTERED. Defaults fail-CLOSED (deny) for that reason; an
+    # operator who'd rather degrade to "let it through" during an OPA
+    # outage can opt into that explicitly and it's logged loudly either way
+    # (see opa_client.evaluate_opa_policy).
+    opa_fail_closed: bool = True
+
+    # --- Tool sandboxing / egress control (see app/tool_registry/egress.py) -
+    # Comma-separated platform-wide hostname allowlist for http_tool's
+    # outbound calls (a leading "." means "this domain or any subdomain",
+    # e.g. ".example.com" matches both example.com and api.example.com).
+    # Empty (the default) means unrestricted — every http_tool call site
+    # already existed before this, so this ships as a pure opt-in an
+    # operator turns on once they've enumerated what SHOULD be reachable,
+    # not a default that would break every existing tool config. A tool's
+    # own `config.egress_allowlist` (see http_tool.py) overrides this list
+    # entirely for that one tool rather than being merged with it — a
+    # tool-specific allowlist is a deliberate, tighter scope, not an
+    # addition to the platform default.
+    tool_egress_allowlist_raw: str = ""
+
+    @property
+    def tool_egress_allowlist(self) -> list[str]:
+        return [h.strip().lower() for h in self.tool_egress_allowlist_raw.split(",") if h.strip()]
+
+    # --- Multi-tenancy: rate limiting + per-workspace config -----------------
+    # "memory" (default): app/rate_limit_backends.InMemoryBackend, exactly
+    # today's per-process behavior — a fresh checkout needs nothing extra.
+    # "redis": RedisBackend, for a multi-instance deployment where every
+    # process must enforce the SAME budget against shared state (an
+    # in-memory backend would silently give every instance its own
+    # allowance, which is wrong the moment there's more than one). Requires
+    # `redis_url` and the `redis` package installed.
+    rate_limit_backend: str = "memory"
+    redis_url: str = "redis://localhost:6379/0"
+    # Platform-wide default aggregate budget across every principal in one
+    # workspace (catches "this whole tenant is unusually busy", distinct
+    # from rate_limit_principal's per-user budget which catches one abusive
+    # caller within a tenant) — a specific workspace's own
+    # WorkspaceConfig.max_requests_per_minute (see app/models/workspaces.py),
+    # if set, overrides this default for just that workspace.
+    workspace_max_requests_per_minute: int = 200
+
+    # --- Temporal-backed durable workflows (see app/durable_workflow/) -----
+    # A SEPARATE, heavier-weight durable-execution spine from
+    # app.reliability.durable_execution_config's existing one: that one
+    # resumes a single crashed CHAT TURN via ADK's own resumability +
+    # Postgres checkpoints (see the "Durable Execution & Reliability"
+    # README section) — this one is for a genuinely long-running,
+    # multi-step BUSINESS PROCESS with real side effects (the saga/
+    # compensation worked example, reservation_demo_tool, ported to a real
+    # Temporal workflow in app/durable_workflow/workflows.py) that needs to
+    # survive a WORKER process crash, not just resume one ADK invocation.
+    # Off by default -- requires `pip install -e ".[temporal]"` (a separate
+    # extra, not a main dependency, since the temporalio package itself is
+    # a heavy binary wheel) AND a real Temporal server reachable at
+    # `temporal_target` (`docker compose up -d temporal` for a local one).
+    temporal_enabled: bool = False
+    temporal_target: str = "localhost:7233"
+    temporal_namespace: str = "default"
+    temporal_task_queue: str = "agent-forge-reliability"
+
     @model_validator(mode="after")
     def _fail_fast_on_weak_config_outside_dev(self) -> "Settings":
         """`env` defaults to "development", so a fresh local checkout is

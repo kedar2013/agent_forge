@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 import uuid
 from datetime import datetime, timezone
@@ -19,11 +20,12 @@ from app.logging_hooks import log_invocation_fire_and_forget, set_durable_attemp
 from app.models.agents import Agent as AgentRow
 from app.agent_runtime.builder import close_agent_toolsets, get_or_build_agent
 from app.agent_runtime.byok import required_providers, resolve_request_api_keys, use_api_keys
+from app.agent_runtime.cascade import build_escalated_agent, is_escalation_over_budget
 from app.observability.pricing import estimate_cost_usd
 from app.observability.rca import cap_payload, classify_error, tool_call_error
 from app.observability.tracing import get_tracer
 from app.principal import Principal, require_role
-from app.rate_limit import rate_limit_principal
+from app.rate_limit import rate_limit_workspace
 from app.reliability.compensation import run_compensations
 from app.reliability.durable_execution_config import get_durable_execution_config
 from app.scil.corrector import build_correction_message, lookup_known_correction, save_correction_fire_and_forget
@@ -46,6 +48,8 @@ from app.schemas.playground import (
     PlaygroundRunResponse,
     ToolCallTrace,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/playground", tags=["playground"])
 invoke_router = APIRouter(prefix="/agents", tags=["invoke"])
@@ -88,6 +92,28 @@ def _span_json(value: Any) -> str:
     DB-stored copy (`cap_payload`) so a real trace backend like Langfuse/
     Jaeger never gets a multi-megabyte attribute either."""
     return json.dumps(cap_payload(value), default=str)
+
+
+def _emit_scil_cache_span(route: str, *, agent_name: str, session_id: str, latency_ms: int) -> None:
+    """A short-lived OTel span for a SCIL short-circuit (template match or
+    semantic-cache hit) — zero LLM calls, so unlike a real turn there's no
+    `agent.invocation` span this would otherwise attach to. Without this, a
+    cache hit was invisible in the trace view even though it's a
+    meaningfully different outcome (0 tokens, near-zero latency) from a
+    real LLM turn — see `route` (matches the same "deterministic"/
+    "cache_hit" value `log_metrics_fire_and_forget` records) to tell the
+    two short-circuit kinds apart in a trace backend."""
+    tracer = get_tracer()
+    span = tracer.start_span(
+        "scil.cache",
+        attributes={
+            "scil.route": route,
+            "agent.name": agent_name,
+            "session.id": session_id,
+            "scil.latency_ms": latency_ms,
+        },
+    )
+    span.end()
 
 
 def _fallback_text_from_tool_calls(tool_calls: list[ToolCallTrace]) -> str | None:
@@ -140,6 +166,7 @@ class _RunOutcome:
         "output_tokens",
         "last_author",
         "otel_trace_id",
+        "adk_invocation_id",
     )
 
     def __init__(self) -> None:
@@ -153,11 +180,22 @@ class _RunOutcome:
         self.output_tokens: int | None = None
         self.last_author: str | None = None
         self.otel_trace_id: str | None = None
+        # ADK's own per-run id — always assigned (auto-generated when the
+        # caller doesn't pin one, see _execute_run's `invocation_id` param),
+        # unlike InvocationLog.adk_invocation_id historically was ("only
+        # populated for durable-execution-enabled agents"). Capturing it
+        # unconditionally here is what makes GuardrailEvent/PolicyEvent
+        # (keyed by this same ADK-assigned id, captured at callback time —
+        # see agent_runtime/builder.py) joinable back to InvocationLog for
+        # ANY agent, not just durable-execution ones — see
+        # debug_api.router.get_lineage.
+        self.adk_invocation_id: str | None = None
 
 
 async def _execute_run(
     *,
     adk_agent: AdkAgent,
+    model: str,
     session_service: BaseSessionService,
     app_name: str,
     user_id: str,
@@ -179,7 +217,11 @@ async def _execute_run(
     tool failure otherwise looked identical to a success everywhere
     downstream, since ADK itself doesn't raise for it. Agent-to-agent
     transfers are recorded as `events`, not spans — they're instantaneous
-    hand-offs, not something with its own duration. With tracing disabled
+    hand-offs, not something with its own duration. The root span also
+    carries `llm.model`/`llm.input_tokens`/`llm.output_tokens`/`llm.cost_usd`
+    once the run completes — the same figures `InvocationLog` persists,
+    now also queryable/graphable in whatever trace backend OTEL_ENABLED
+    points at, not just this app's own DB. With tracing disabled
     (default), `get_tracer()` returns a no-op tracer and all of this costs
     effectively nothing.
 
@@ -224,6 +266,9 @@ async def _execute_run(
                 new_message=new_message,
                 state_delta=state_delta,
             ):
+                if outcome.adk_invocation_id is None and event.invocation_id:
+                    outcome.adk_invocation_id = event.invocation_id
+
                 # Tracks whichever agent authored the most recent event — for a
                 # request that transferred to a specialist, this ends up being the
                 # specialist, not the root orchestrator that was actually invoked.
@@ -367,6 +412,14 @@ async def _execute_run(
             if span is not None:
                 span.end()
         root_span.set_attribute("invocation.status", outcome.status)
+        root_span.set_attribute("llm.model", model)
+        if outcome.input_tokens is not None:
+            root_span.set_attribute("llm.input_tokens", outcome.input_tokens)
+        if outcome.output_tokens is not None:
+            root_span.set_attribute("llm.output_tokens", outcome.output_tokens)
+        cost = estimate_cost_usd(model, outcome.input_tokens, outcome.output_tokens)
+        if cost is not None:
+            root_span.set_attribute("llm.cost_usd", cost)
 
     return outcome
 
@@ -420,6 +473,9 @@ async def _stream_turn(
             llm_calls=0,
             latency_ms=template_latency_ms,
         )
+        _emit_scil_cache_span(
+            "deterministic", agent_name=adk_agent.name, session_id=session_id, latency_ms=template_latency_ms
+        )
         yield {"type": "cache_hit"}
         yield {
             "type": "done",
@@ -439,6 +495,9 @@ async def _stream_turn(
             route="cache_hit",
             llm_calls=0,
             latency_ms=cache_latency_ms,
+        )
+        _emit_scil_cache_span(
+            "cache_hit", agent_name=adk_agent.name, session_id=session_id, latency_ms=cache_latency_ms
         )
         yield {"type": "cache_hit"}
         yield {
@@ -461,6 +520,7 @@ async def _stream_turn(
         )
 
     runner = Runner(agent=adk_agent, app_name=app_name, session_service=session_service)
+    model = agent_row.model_config_json.get("model", "gemini-3.5-flash")
 
     tool_calls: list[ToolCallTrace] = []
     tool_call_records: list[dict[str, Any]] = []
@@ -472,6 +532,7 @@ async def _stream_turn(
     input_tokens: int | None = None
     output_tokens: int | None = None
     last_author: str | None = None
+    adk_invocation_id: str | None = None
     start = time.monotonic()
 
     tracer = get_tracer()
@@ -488,6 +549,9 @@ async def _stream_turn(
                 new_message=types.Content(role="user", parts=[types.Part.from_text(text=llm_message)]),
                 state_delta=state_delta,
             ):
+                if adk_invocation_id is None and event.invocation_id:
+                    adk_invocation_id = event.invocation_id
+
                 prior_author = last_author
                 if event.author:
                     last_author = event.author
@@ -623,6 +687,14 @@ async def _stream_turn(
             if leftover_span is not None:
                 leftover_span.end()
         root_span.set_attribute("invocation.status", status)
+        root_span.set_attribute("llm.model", model)
+        if input_tokens is not None:
+            root_span.set_attribute("llm.input_tokens", input_tokens)
+        if output_tokens is not None:
+            root_span.set_attribute("llm.output_tokens", output_tokens)
+        stream_cost = estimate_cost_usd(model, input_tokens, output_tokens)
+        if stream_cost is not None:
+            root_span.set_attribute("llm.cost_usd", stream_cost)
 
     latency_ms = int((time.monotonic() - start) * 1000)
     response_text = "".join(final_text_parts)
@@ -630,7 +702,6 @@ async def _stream_turn(
         response_text = _fallback_text_from_tool_calls(tool_calls) or (
             "Sorry, I couldn't come up with an answer to that — could you try rephrasing?"
         )
-    model = agent_row.model_config_json.get("model", "gemini-3.5-flash")
     error_category = classify_error(
         status=status, error_message=error_message, events=events, tool_call_records=tool_call_records
     )
@@ -646,13 +717,14 @@ async def _stream_turn(
         latency_ms=latency_ms,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
-        estimated_cost_usd=estimate_cost_usd(model, input_tokens, output_tokens),
+        estimated_cost_usd=stream_cost,
         error_message=error_message,
         invoked_by=user_id,
         transcript={"message": message, "response_text": response_text},
         tool_calls=tool_call_records,
         events=events,
         resolved_author=last_author,
+        adk_invocation_id=adk_invocation_id,
     )
 
     log_metrics_fire_and_forget(
@@ -714,6 +786,13 @@ async def _run_turn(
     scil_request_id = uuid.uuid4()
     scil_start = time.monotonic()
     scil_config = get_scil_config(agent_row)
+    model = agent_row.model_config_json.get("model", "gemini-3.5-flash")
+    # Tracks whichever model actually produced the FINAL persisted answer —
+    # stays `model` unless model cascading (see app/agent_runtime/cascade.py)
+    # escalated a retry, in which case the cost/usage this turn gets
+    # attributed to should reflect the bigger model actually used, not the
+    # cheaper one the turn started on.
+    final_model_used = model
 
     # Durable execution (see app/reliability/): an eager 'running' row lets a
     # crash mid-turn leave a resumable trace instead of no row at all — see
@@ -732,18 +811,30 @@ async def _run_turn(
             invoked_by=user_id,
         )
 
-    async def _run_attempt(attempt_message: str) -> "_RunOutcome":
+    async def _run_attempt(
+        attempt_message: str, agent_override: AdkAgent | None = None, model_override: str | None = None
+    ) -> "_RunOutcome":
         """Every _execute_run(...) call this turn makes (the initial
         attempt, and any stale-session/hallucination/SCIL retry below) goes
         through here so each one gets its own fresh ADK invocation id,
         durably pointed at by invocation_log_id before it runs — whichever
-        attempt is CURRENTLY live is always the one a resume would continue."""
+        attempt is CURRENTLY live is always the one a resume would continue.
+
+        `agent_override`/`model_override` are model-cascading's hook (see
+        app/agent_runtime/cascade.py): the SCIL retry loop below passes an
+        escalated-model copy of `adk_agent` (plus the matching raw model
+        string, so the span/cost attributes _execute_run records reflect
+        whichever model actually ran, not the original) once a validator
+        has flagged the base model's answer, instead of blindly retrying
+        on the same model — every other retry path here (stale-session,
+        tool-hallucination) never sets either, so they're unaffected."""
         adk_invocation_id = None
         if use_durable:
             adk_invocation_id = str(uuid.uuid4())
             await set_durable_attempt(invocation_log_id, adk_invocation_id)
         return await _execute_run(
-            adk_agent=adk_agent,
+            adk_agent=agent_override or adk_agent,
+            model=model_override or model,
             session_service=session_service,
             app_name=app_name,
             user_id=user_id,
@@ -764,6 +855,9 @@ async def _run_turn(
             llm_calls=0,
             latency_ms=template_latency_ms,
         )
+        _emit_scil_cache_span(
+            "deterministic", agent_name=adk_agent.name, session_id=session_id, latency_ms=template_latency_ms
+        )
         return PlaygroundRunResponse(
             response_text=template_answer, tool_calls=[], latency_ms=template_latency_ms, session_id=session_id
         )
@@ -777,6 +871,9 @@ async def _run_turn(
             route="cache_hit",
             llm_calls=0,
             latency_ms=cache_latency_ms,
+        )
+        _emit_scil_cache_span(
+            "cache_hit", agent_name=adk_agent.name, session_id=session_id, latency_ms=cache_latency_ms
         )
         payload = scil_hit.output_payload
         return PlaygroundRunResponse(
@@ -903,6 +1000,35 @@ async def _run_turn(
         scil_validation = await _validate_this_attempt()
         first_failure = None if scil_validation.ok else scil_validation
         first_failed_text = response_text
+        # Model cascading (see app/agent_runtime/cascade.py): a validator
+        # failure IS this platform's "low confidence" signal — built once,
+        # lazily, only the first time it's actually needed, and reused for
+        # every subsequent retry this turn (escalate once, stay escalated,
+        # rather than oscillating between models across retries). None
+        # whenever escalation_model isn't configured, or this agent has
+        # sub_agents (see build_escalated_agent's docstring) — every retry
+        # below then falls back to `adk_agent`, exactly today's behavior.
+        escalated_agent: AdkAgent | None = None
+        if not scil_validation.ok and scil_config.escalation_model:
+            # Cost budget: estimate the escalation's likely cost from the
+            # FAILED attempt's own token counts (a same-turn proxy for what
+            # the bigger model would probably cost, not a guarantee) and
+            # skip escalating if that would already blow the configured
+            # ceiling — the turn keeps its low-confidence answer rather
+            # than silently exceeding a per-turn budget to chase a fix.
+            estimated_escalation_cost = estimate_cost_usd(
+                scil_config.escalation_model, outcome.input_tokens, outcome.output_tokens
+            )
+            if is_escalation_over_budget(estimated_escalation_cost, scil_config.escalation_max_cost_usd):
+                logger.info(
+                    "SCIL: skipping model-cascade escalation for agent %s — estimated cost $%.4f exceeds "
+                    "escalation_max_cost_usd $%.4f",
+                    agent_row.id,
+                    estimated_escalation_cost,
+                    scil_config.escalation_max_cost_usd,
+                )
+            else:
+                escalated_agent = build_escalated_agent(adk_agent, scil_config.escalation_model)
         while not scil_validation.ok and scil_retries < scil_config.max_retries:
             known_correction = await lookup_known_correction(
                 agent_row.id, scil_validation.error_signature, scil_normalized
@@ -915,7 +1041,13 @@ async def _run_turn(
                 known_correction=known_correction,
             )
             scil_retries += 1
-            outcome = await _run_attempt(correction_message)
+            outcome = await _run_attempt(
+                correction_message,
+                agent_override=escalated_agent,
+                model_override=scil_config.escalation_model if escalated_agent else None,
+            )
+            if escalated_agent is not None:
+                final_model_used = scil_config.escalation_model
             all_tool_call_records += outcome.tool_call_records
             all_events += outcome.events
             if outcome.status != "success":
@@ -967,7 +1099,6 @@ async def _run_turn(
             remember_entities_fire_and_forget(agent_row.id, outcome.tool_calls)
 
     latency_ms = int((time.monotonic() - start) * 1000)
-    model = agent_row.model_config_json.get("model", "gemini-3.5-flash")
     error_category = classify_error(
         status=outcome.status,
         error_message=outcome.error_message,
@@ -987,7 +1118,7 @@ async def _run_turn(
         latency_ms=latency_ms,
         input_tokens=outcome.input_tokens,
         output_tokens=outcome.output_tokens,
-        estimated_cost_usd=estimate_cost_usd(model, outcome.input_tokens, outcome.output_tokens),
+        estimated_cost_usd=estimate_cost_usd(final_model_used, outcome.input_tokens, outcome.output_tokens),
         error_message=outcome.error_message,
         invoked_by=user_id,
         transcript={"message": message, "response_text": response_text},
@@ -999,6 +1130,7 @@ async def _run_turn(
         tool_calls=None if use_durable else all_tool_call_records,
         events=all_events,
         resolved_author=outcome.last_author,
+        adk_invocation_id=outcome.adk_invocation_id,
     )
 
     log_metrics_fire_and_forget(
@@ -1064,7 +1196,7 @@ async def _run_turn(
     )
 
 
-@router.post("/run", response_model=PlaygroundRunResponse, dependencies=[Depends(rate_limit_principal)])
+@router.post("/run", response_model=PlaygroundRunResponse, dependencies=[Depends(rate_limit_workspace)])
 async def run_playground(
     payload: PlaygroundRunRequest,
     db: AsyncSession = Depends(get_db),
@@ -1113,7 +1245,7 @@ async def run_playground(
 
 
 @invoke_router.post(
-    "/{agent_id}/invoke", response_model=PlaygroundRunResponse, dependencies=[Depends(rate_limit_principal)]
+    "/{agent_id}/invoke", response_model=PlaygroundRunResponse, dependencies=[Depends(rate_limit_workspace)]
 )
 async def invoke_published_agent(
     agent_id: uuid.UUID,

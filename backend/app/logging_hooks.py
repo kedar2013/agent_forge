@@ -143,6 +143,7 @@ async def _write_invocation_log(
     resolved_author: str | None = None,
     otel_trace_id: str | None = None,
     error_category: str | None = None,
+    adk_invocation_id: str | None = None,
 ) -> None:
     """`agent_id`/`agent_version` as passed in are whichever agent was
     actually INVOKED by the caller (e.g. the chat root orchestrator) — for a
@@ -198,6 +199,16 @@ async def _write_invocation_log(
             invocation.error_message = error_message
             invocation.invoked_by = invoked_by
             invocation.transcript = transcript
+            # For a durable-execution turn this was already set (to the
+            # same value) by set_durable_attempt before the run started;
+            # for every other agent this is the only place it's ever
+            # written. See _RunOutcome.adk_invocation_id's docstring for
+            # why this is captured unconditionally now, not just for
+            # durable turns — it's the join key GuardrailEvent/PolicyEvent
+            # use to correlate back to this row (see debug_api.router.
+            # get_lineage).
+            if adk_invocation_id is not None:
+                invocation.adk_invocation_id = adk_invocation_id
             await session.flush()
 
             tool_names = [call["name"] for call in (tool_calls or []) if call.get("name")]

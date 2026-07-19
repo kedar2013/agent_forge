@@ -1,11 +1,14 @@
 import logging
 import uuid
+from collections import deque
 
 from google.adk.agents import Agent as AdkAgent
 from google.adk.models.lite_llm import LiteLlm
+from google.adk.models.llm_response import LlmResponse
 from google.adk.planners import PlanReActPlanner
 from google.adk.tools.base_toolset import BaseToolset
-from sqlalchemy import select
+from google.genai import types
+from sqlalchemy import exists, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,13 +17,18 @@ from app.agent_runtime.cache import agent_cache
 from app.agent_runtime.planning_config import get_planning_config
 from app.agent_runtime.schema_utils import build_output_schema_model
 from app.db import async_session_factory
+from app.guardrails.config import get_guardrails_config
+from app.guardrails.service import enforce_input, enforce_output
 from app.models.access_policies import AccessPolicy
 from app.models.agents import Agent, AgentSkill, AgentSubagent, AgentTool, AgentVersion
 from app.models.logs import InvocationLog, ToolCallLog
 from app.models.skills import Skill
-from app.models.tools import Tool
+from app.models.tools import Tool, ToolGrant
 from app.observability.rca import cap_payload, tool_call_error
 from app.tool_registry.factory import build_tool
+from app.tool_registry.opa_client import evaluate_opa_policy
+from app.tool_registry.output_validation import validate_tool_output
+from app.tool_registry.policy_audit import record_policy_denial
 from app.tool_registry.policy_engine import ScopeResolution, apply_policy, resolve_scope
 
 logger = logging.getLogger(__name__)
@@ -78,7 +86,12 @@ async def _resolve_durable_invocation_id(tool_context) -> uuid.UUID | None:
 
 
 def _build_before_tool_callback(
-    tools_rows: list[Tool], policies_by_id: dict[str, AccessPolicy], durable_execution_enabled: bool = False
+    tools_rows: list[Tool],
+    policies_by_id: dict[str, AccessPolicy],
+    durable_execution_enabled: bool = False,
+    replay_by_tool_name: dict[str, deque] | None = None,
+    agent_row: Agent | None = None,
+    workspace_id: uuid.UUID | None = None,
 ):
     """One callback, registered on every agent this platform builds, that
     generically (a) caps how many agent-to-agent hand-offs can happen in a
@@ -103,6 +116,18 @@ def _build_before_tool_callback(
     None of these four are specific to any one tool type or domain: a
     future domain/orchestrator opts in purely through its own config (or,
     for the hop cap, simply by existing) — no code here changes.
+
+    `replay_by_tool_name` is a fifth, separate concern: only ever set by
+    app.replay.service (see app/agent_runtime/builder.build_replay_agent),
+    never by a normal turn. When a queued recorded output exists for this
+    tool name, it's returned immediately — ahead of and instead of every
+    other branch above (durable-execution/context_params/policy all become
+    irrelevant: replay wants the EXACT historical output, not a freshly
+    re-derived one). A tool called more times in the replay than it was
+    recorded (queue exhausted, or no queue for this tool at all — e.g. the
+    trajectory diverged because the prompt/tools changed since the
+    original run) falls through to every branch below exactly as a normal
+    turn would, rather than erroring.
     """
     context_params_by_tool = {
         t.name: t.config["context_params"] for t in tools_rows if t.config.get("context_params")
@@ -110,6 +135,11 @@ def _build_before_tool_callback(
     policy_by_tool = {t.name: t.config["policy_id"] for t in tools_rows if t.config.get("policy_id")}
 
     async def _before_tool(tool, args, tool_context):
+        if replay_by_tool_name is not None:
+            queue = replay_by_tool_name.get(tool.name)
+            if queue:
+                return queue.popleft()
+
         if tool.name == "transfer_to_agent":
             # invocation_id is unique per top-level runner.run_async() call
             # (one user turn) and never reused across turns, so this counter
@@ -177,8 +207,36 @@ def _build_before_tool_callback(
             scope = await resolve_scope(policy, user_id)
             tool_context.state[cache_key] = scope.to_state()
 
-        result = apply_policy(policy, scope, args)
+        # Phase 2 (this exact call's decision) is the one part of a policy
+        # that can be swapped for OPA/Rego per-policy — phase 1 (scope
+        # resolution above) is unchanged either way. See
+        # app/tool_registry/opa_client.py and backend/policies/*.rego.
+        engine_used = "opa" if policy.resolver_config.get("engine") == "opa" else "python"
+        if engine_used == "opa":
+            opa_package = policy.resolver_config.get("opa_package")
+            if not opa_package:
+                logger.error("AccessPolicy %s sets engine='opa' but no opa_package", policy_id)
+                return {"error": "Misconfigured policy: engine is 'opa' but no opa_package is set."}
+            result = await evaluate_opa_policy(
+                opa_package, {"persona": scope.discriminator, "scope": scope.scope, "args": args}
+            )
+        else:
+            result = apply_policy(policy, scope, args)
         if not result.allowed:
+            # A denial is the governance event worth an audit trail (see
+            # app.tool_registry.policy_audit) — an allow is the default
+            # "matched persona rule" path, not itself an exception.
+            await record_policy_denial(
+                workspace_id=workspace_id,
+                agent_id=agent_row.id if agent_row else None,
+                agent_name=agent_row.name if agent_row else None,
+                adk_invocation_id=tool_context.invocation_id,
+                tool_name=tool.name,
+                policy_id=policy.id,
+                engine=engine_used,
+                persona=scope.discriminator,
+                reason=result.reason,
+            )
             return {"error": result.reason}
         # `result.filter` is opaque here by design: whatever reserved keys a
         # policy's rule produced get merged straight into the tool's args.
@@ -206,16 +264,40 @@ def _build_after_tool_callback(tools_rows: list[Tool], durable_execution_enabled
     `tool_id` is resolved by name against this agent's own `tools_rows`
     (already loaded once at build time, same as `context_params_by_tool`/
     `policy_by_tool` above) rather than a second query per call.
+
+    Also runs output_schema validation (see tool_registry.output_validation)
+    for any tool that declares one — independent of durable_execution:
+    every agent gets this check on any tool that opted in, not just
+    durable-enabled ones. A failure REPLACES the response (returned to
+    ADK, which swaps it in for what the model actually sees) rather than
+    just logging, and durable logging below records the replacement, not
+    the original malformed payload — the ToolCallLog row should reflect
+    what the model was actually shown.
     """
     tool_id_by_name = {t.name: t.id for t in tools_rows}
+    output_schema_by_name = {t.name: t.output_schema for t in tools_rows if t.output_schema}
 
     async def _after_tool(tool, args, tool_context, tool_response):
+        replacement = None
+        schema = output_schema_by_name.get(tool.name)
+        if schema is not None:
+            validation_error = validate_tool_output(tool_response, schema)
+            if validation_error:
+                logger.warning(
+                    "Tool '%s' response failed its declared output_schema: %s", tool.name, validation_error
+                )
+                replacement = {
+                    "error": f"Tool '{tool.name}' returned a response that doesn't match its declared "
+                    f"output_schema ({validation_error}) — treat this as a failed call, not real data."
+                }
+                tool_response = replacement
+
         if not durable_execution_enabled or tool.name == "transfer_to_agent" or not tool_context.function_call_id:
-            return None
+            return replacement
 
         invocation_log_id = await _resolve_durable_invocation_id(tool_context)
         if invocation_log_id is None:
-            return None
+            return replacement
 
         idempotency_key = f"{tool_context.invocation_id}:{tool_context.function_call_id}"
         counter_key = f"_durable_call_index:{tool_context.invocation_id}"
@@ -244,9 +326,129 @@ def _build_after_tool_callback(tools_rows: list[Tool], durable_execution_enabled
                 # idempotency_key) constraint makes a duplicate write here a
                 # harmless no-op, not a real conflict.
                 await session.rollback()
-        return None
+        return replacement
 
     return _after_tool
+
+
+def _extract_latest_user_text(llm_request) -> str:
+    """The most recent user-authored turn in `llm_request.contents` — not
+    the whole history (already checked on a prior call) and not the model's
+    own or a tool's prior turns. This is what the model is *about* to
+    respond to, which is what an input guardrail cares about."""
+    for content in reversed(llm_request.contents):
+        if content.role == "user" and content.parts:
+            texts = [p.text for p in content.parts if getattr(p, "text", None)]
+            if texts:
+                return "\n".join(texts)
+    return ""
+
+
+def _extract_response_text(llm_response: LlmResponse) -> str:
+    if not llm_response.content or not llm_response.content.parts:
+        return ""
+    # Planner "thought" scaffolding (see planning_config.py) is the model's
+    # own scratch reasoning, never shown to the user — an output guardrail
+    # judging user-facing text has no business seeing or blocking on it.
+    return "\n".join(
+        p.text for p in llm_response.content.parts if getattr(p, "text", None) and not getattr(p, "thought", False)
+    )
+
+
+def _redacted_response(llm_response: LlmResponse, redacted_text: str | None) -> LlmResponse:
+    """Rebuilds `llm_response.content` with only the (first) text part's
+    content replaced — every other part (e.g. a function_call the model
+    emitted alongside its text) passes through untouched. A response with
+    more than one text part (rare) collapses to a single redacted part
+    rather than trying to re-split `redacted_text` back across them."""
+    if redacted_text is None or not llm_response.content:
+        return llm_response
+    new_parts = []
+    replaced = False
+    for part in llm_response.content.parts or []:
+        if getattr(part, "text", None) and not getattr(part, "thought", False):
+            if not replaced:
+                new_parts.append(types.Part.from_text(text=redacted_text))
+                replaced = True
+            continue
+        new_parts.append(part)
+    return LlmResponse(content=types.Content(role=llm_response.content.role, parts=new_parts))
+
+
+def _blocked_response(message: str) -> LlmResponse:
+    return LlmResponse(content=types.Content(role="model", parts=[types.Part.from_text(text=message)]))
+
+
+def _build_before_model_callback(agent_row: Agent, workspace_id: uuid.UUID | None):
+    """Central input guardrail: prompt-injection/jailbreak heuristics plus
+    an optional topical-scope judge (see app/guardrails/), enforced on
+    every agent this platform builds — not per-agent opt-in code, only
+    per-agent opt-out via model_config.guardrails (see
+    app.guardrails.config.get_guardrails_config). Registered on every
+    AdkAgent node (orchestrator AND every specialist), so a transfer hop
+    doesn't bypass it — ADK invokes before_model_callback on whichever
+    agent is about to call the model, every single call.
+
+    Config is resolved once at build time from the agent's LIVE row (even
+    when this build is for a published snapshot — see _build_from_snapshot)
+    because guardrails are an operator-owned safety floor, not a per-version
+    frozen feature: baked into the cached build the same as every other
+    config knob here, so a live guardrails change on a published agent takes
+    effect on its next publish/cache-evict, same contract as the rest of
+    this module, not a new gap.
+    """
+    config = get_guardrails_config(agent_row)
+    if not config.enabled:
+        return None
+
+    async def _before_model(callback_context, llm_request):
+        text = _extract_latest_user_text(llm_request)
+        verdict = await enforce_input(
+            text,
+            config,
+            agent_row,
+            workspace_id=workspace_id,
+            agent_id=agent_row.id,
+            agent_name=agent_row.name,
+            adk_invocation_id=callback_context.invocation_id,
+        )
+        if verdict.ok:
+            return None
+        return _blocked_response(config.block_message)
+
+    return _before_model
+
+
+def _build_after_model_callback(agent_row: Agent, workspace_id: uuid.UUID | None):
+    """Central output guardrail: PII/MNPI/toxicity checks (see
+    app/guardrails/) on every real text response any agent node produces,
+    before it ever reaches the caller or a sibling agent via transfer.
+    Same live-config-at-build-time reasoning as _build_before_model_callback.
+    """
+    config = get_guardrails_config(agent_row)
+    if not config.enabled:
+        return None
+
+    async def _after_model(callback_context, llm_response: LlmResponse):
+        text = _extract_response_text(llm_response)
+        if not text:
+            return None
+        verdict = await enforce_output(
+            text,
+            config,
+            agent_row,
+            workspace_id=workspace_id,
+            agent_id=agent_row.id,
+            agent_name=agent_row.name,
+            adk_invocation_id=callback_context.invocation_id,
+        )
+        if verdict.ok:
+            return None
+        if verdict.action == "redact":
+            return _redacted_response(llm_response, verdict.redacted_text)
+        return _blocked_response(config.block_message)
+
+    return _after_model
 
 
 def _resolve_model(model: str) -> str | LiteLlm:
@@ -297,11 +499,31 @@ async def _load_live_skills(db: AsyncSession, agent_id: uuid.UUID, workspace_id:
     return list(result.scalars().all())
 
 
+def _tool_authorized_for_agent_clause(agent_id: uuid.UUID):
+    """A tool is usable by `agent_id` when it's the default access_scope
+    ("workspace" — any agent in the tool's own workspace, today's
+    unrestricted behavior, unaffected by this clause) OR it's "restricted"
+    AND this specific agent has an explicit ToolGrant row. Applied both
+    where tools are loaded for a build (excluded silently if unauthorized —
+    same "missing or cross-tenant" convention already used for sub-agents
+    elsewhere in this file — defense in depth against a grant revoked
+    after attachment, or a stale published snapshot) and at attach time
+    (config_api.agents.attach_tool)."""
+    return or_(
+        Tool.access_scope != "restricted",
+        exists().where(ToolGrant.tool_id == Tool.id, ToolGrant.agent_id == agent_id),
+    )
+
+
 async def _load_live_tools(db: AsyncSession, agent_id: uuid.UUID, workspace_id: uuid.UUID | None) -> list[Tool]:
     result = await db.execute(
         select(Tool)
         .join(AgentTool, AgentTool.tool_id == Tool.id)
-        .where(AgentTool.agent_id == agent_id, Tool.workspace_id == workspace_id)
+        .where(
+            AgentTool.agent_id == agent_id,
+            Tool.workspace_id == workspace_id,
+            _tool_authorized_for_agent_clause(agent_id),
+        )
     )
     return list(result.scalars().all())
 
@@ -339,8 +561,12 @@ async def _build_from_live_config(
 
     tools: list = [build_tool(t) for t in tools_rows]
     policies_by_id = await _load_policies(db, tools_rows, workspace_id)
-    before_tool_callback = _build_before_tool_callback(tools_rows, policies_by_id, durable_execution_enabled)
+    before_tool_callback = _build_before_tool_callback(
+        tools_rows, policies_by_id, durable_execution_enabled, agent_row=agent, workspace_id=workspace_id
+    )
     after_tool_callback = _build_after_tool_callback(tools_rows, durable_execution_enabled)
+    before_model_callback = _build_before_model_callback(agent, workspace_id)
+    after_model_callback = _build_after_model_callback(agent, workspace_id)
 
     sub_agents: list[AdkAgent] = []
     for child_id in subagent_ids:
@@ -364,6 +590,8 @@ async def _build_from_live_config(
         sub_agents=sub_agents,
         before_tool_callback=before_tool_callback,
         after_tool_callback=after_tool_callback,
+        before_model_callback=before_model_callback,
+        after_model_callback=after_model_callback,
         output_schema=build_output_schema_model(agent.output_schema),
         output_key=agent.output_key,
         # Decided per-node from this agent's OWN model_config, not inherited
@@ -390,6 +618,7 @@ async def _build_from_snapshot(
     _building: set[uuid.UUID],
     workspace_id: uuid.UUID | None = None,
     durable_execution_enabled: bool = False,
+    replay_map: dict[str, dict[str, deque]] | None = None,
 ) -> AdkAgent:
     agent_row = await db.get(Agent, agent_id)
     if agent_row is None:
@@ -422,13 +651,34 @@ async def _build_from_snapshot(
     tool_ids = [uuid.UUID(t["id"]) for t in snapshot.get("tools", [])]
     tools_rows: list[Tool] = []
     if tool_ids:
-        result = await db.execute(select(Tool).where(Tool.id.in_(tool_ids), Tool.workspace_id == workspace_id))
+        result = await db.execute(
+            select(Tool).where(
+                Tool.id.in_(tool_ids),
+                Tool.workspace_id == workspace_id,
+                _tool_authorized_for_agent_clause(agent_id),
+            )
+        )
         tools_rows = list(result.scalars().all())
 
     tools: list = [build_tool(t) for t in tools_rows]
     policies_by_id = await _load_policies(db, tools_rows, workspace_id)
-    before_tool_callback = _build_before_tool_callback(tools_rows, policies_by_id, durable_execution_enabled)
+    # This node's own slice of the shared replay_map, keyed by this node's
+    # OWN sanitized agent name — matches exactly how ToolCallLog.agent_name
+    # was recorded in the first place (see playground_api._execute_run:
+    # `event.author`, which is always the built AdkAgent's own `.name`,
+    # i.e. already _safe_agent_name()-sanitized).
+    replay_by_tool_name = (replay_map or {}).get(_safe_agent_name(snapshot["name"]))
+    before_tool_callback = _build_before_tool_callback(
+        tools_rows,
+        policies_by_id,
+        durable_execution_enabled,
+        replay_by_tool_name,
+        agent_row=agent_row,
+        workspace_id=workspace_id,
+    )
     after_tool_callback = _build_after_tool_callback(tools_rows, durable_execution_enabled)
+    before_model_callback = _build_before_model_callback(agent_row, workspace_id)
+    after_model_callback = _build_after_model_callback(agent_row, workspace_id)
 
     sub_agents: list[AdkAgent] = []
     for sub in snapshot.get("sub_agents", []):
@@ -445,7 +695,9 @@ async def _build_from_snapshot(
         # republish, or a second parent that also attaches this agent.
         # durable_execution_enabled is inherited from the ROOT agent being
         # run, not re-derived from each sub-agent's own config — durability
-        # is a property of the whole turn/workflow, decided once.
+        # is a property of the whole turn/workflow, decided once. replay_map
+        # is the same shared dict passed straight through unchanged — each
+        # recursion level slices out its own piece by its own name above.
         sub_agents.append(
             await _build_from_snapshot(
                 db,
@@ -454,6 +706,7 @@ async def _build_from_snapshot(
                 _building | {agent_id},
                 workspace_id,
                 durable_execution_enabled,
+                replay_map,
             )
         )
 
@@ -466,6 +719,8 @@ async def _build_from_snapshot(
         sub_agents=sub_agents,
         before_tool_callback=before_tool_callback,
         after_tool_callback=after_tool_callback,
+        before_model_callback=before_model_callback,
+        after_model_callback=after_model_callback,
         output_schema=build_output_schema_model(snapshot.get("output_schema")),
         output_key=snapshot.get("output_key"),
         # Same per-node planning opt-in as _build_from_live_config, read from
@@ -516,6 +771,22 @@ async def get_or_build_agent(
         return built
 
     return await _build_from_live_config(db, agent_id, building, durable_execution_enabled=durable_execution_enabled)
+
+
+async def build_replay_agent(
+    db: AsyncSession, agent_id: uuid.UUID, version: int, replay_map: dict[str, dict[str, deque]]
+) -> AdkAgent:
+    """Builds the agent tree for a deterministic replay (see app/replay/) —
+    always from the EXACT recorded `agent_versions.snapshot` (reproducing
+    what actually ran back then, not whatever is live/published now), and
+    deliberately bypasses `agent_cache` entirely: `replay_map` is unique to
+    one specific past invocation, so a cached build (shared across every
+    caller of `get_or_build_agent` for this version) can never carry it.
+    The caller owns closing this tree's toolsets when done (see
+    `close_agent_toolsets`) — safe here for the same reason it's safe on a
+    version=None live-config build: nothing else holds a reference to this
+    particular instance."""
+    return await _build_from_snapshot(db, agent_id, version, set(), durable_execution_enabled=False, replay_map=replay_map)
 
 
 async def close_agent_toolsets(agent: AdkAgent) -> None:

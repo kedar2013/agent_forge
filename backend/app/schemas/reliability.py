@@ -42,3 +42,18 @@ class CircuitBreakerEntry(BaseModel):
     state: str
     consecutive_failures: int
     cooldown_remaining_seconds: float | None
+
+
+class TemporalReservationRequest(BaseModel):
+    item: str
+    quantity: int = 1
+    # The demo's deliberate failure trigger (see app.durable_workflow.
+    # activities.confirm_order) -- set to "FORCE_FAIL" to see compensation
+    # (release_inventory) actually fire.
+    order_id: str = "demo-order"
+
+
+class TemporalReservationResponse(BaseModel):
+    workflow_id: str
+    status: str
+    detail: str | None = None

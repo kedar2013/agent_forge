@@ -116,6 +116,60 @@ services:
       - COLLECTOR_OTLP_ENABLED=true
     restart: unless-stopped
 
+  # Local OPA loaded with backend/policies/*.rego for the policy-as-code
+  # AccessPolicy engine (see backend/app/tool_registry/opa_client.py). Off
+  # by default in the app itself (OPA_ENABLED=false) — bring this up, set
+  # OPA_ENABLED=true + OPA_URL=http://localhost:8181 in backend/.env, then
+  # `python scripts/migrate_policy_to_opa.py <policy_name> <opa_package>`
+  # to actually route a specific policy through it.
+  opa:
+    image: openpolicyagent/opa:0.68.0
+    container_name: agent-forge-opa
+    command: ["run", "--server", "--addr", ":8181", "/policies"]
+    volumes:
+      - ./backend/policies:/policies:ro
+    ports:
+      - "8181:8181"
+    restart: unless-stopped
+
+  # Shared rate-limit store for a multi-instance deployment (see
+  # backend/app/rate_limit_backends.RedisBackend). The app defaults to an
+  # in-process limiter (RATE_LIMIT_BACKEND=memory) that needs none of this —
+  # bring this up and set RATE_LIMIT_BACKEND=redis only once you're actually
+  # running more than one backend instance behind a load balancer.
+  redis:
+    image: redis:7-alpine
+    container_name: agent-forge-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  # Local Temporal server for app/durable_workflow/ (the reservation-demo
+  # saga durably orchestrated by a real Temporal workflow instead of the
+  # in-process version — see reservation_demo_tool.py). Off by default in
+  # the app itself (TEMPORAL_ENABLED=false) — bring this up, set
+  # TEMPORAL_ENABLED=true in backend/.env, then run
+  # `python scripts/run_temporal_worker.py` alongside the API server.
+  # Reuses this file's own `postgres` service for persistence (auto-setup
+  # creates its own `temporal`/`temporal_visibility` databases there on
+  # first boot) rather than standing up a second database server.
+  temporal:
+    image: temporalio/auto-setup:1.24
+    container_name: agent-forge-temporal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - POSTGRES_USER=agent_forge
+      - POSTGRES_PWD=agent_forge
+      - POSTGRES_SEEDS=postgres
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+    ports:
+      - "7233:7233" # gRPC, what TEMPORAL_TARGET points at
+      - "8233:8233" # Web UI
+    restart: unless-stopped
+
   # Optional local MongoDB for the generic `mongo_query_tool` tool type
   # (backend/app/tool_registry/mongo_tool.py) — not required by Credit
   # Facility Analysis (that domain now runs on MySQL, see backend/.env's

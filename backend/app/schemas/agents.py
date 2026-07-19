@@ -12,9 +12,7 @@ class ScilAgentConfig(BaseModel):
     structure never breaks agent invocation. This schema exists so the
     field actually round-trips through POST/PATCH /api/agents instead of
     being silently dropped by ModelConfig's default extra="ignore"
-    behavior. Fields beyond `enabled`/`cache_similarity_threshold`/
-    `cache_ttl_hours` are accepted now (so a full config can be saved
-    without validation errors) but unused until later SCIL phases."""
+    behavior."""
 
     enabled: bool = False
     cache_similarity_threshold: float = 0.80
@@ -24,7 +22,11 @@ class ScilAgentConfig(BaseModel):
     cache_scope: Literal["global", "user"] = "global"
     max_retries: int = 2
     exemplar_top_k: int = 3
+    # Model cascading (see app/agent_runtime/cascade.py) — once a validator
+    # flags a low-confidence first attempt, retries run on this model
+    # instead of the agent's own, up to escalation_max_cost_usd if set.
     escalation_model: str | None = None
+    escalation_max_cost_usd: float | None = None
     validators: list[str] = Field(default_factory=list)
     templates_enabled: bool = False
     # [{"pattern": "<regex with named groups>", "response_text": "...{slot}..."}]
@@ -46,10 +48,47 @@ class ScilAgentConfig(BaseModel):
     # call (only an embedding lookup).
 
 
+class GuardrailsInputConfig(BaseModel):
+    prompt_injection_check: bool = True
+    jailbreak_check: bool = True
+    # Free-text description of what this agent should answer — judged by an
+    # LLM call, so topical_scope_check defaults off even when guardrails
+    # overall are on; see app/guardrails/config.py.
+    topical_scope: str | None = None
+    topical_scope_check: bool = False
+
+
+class GuardrailsOutputConfig(BaseModel):
+    pii_check: bool = True
+    mnpi_check: bool = True
+    toxicity_check: bool = True
+    # Merged with (not replacing) the platform-wide GUARDRAILS_MNPI_TERMS_RAW
+    # list at check time — see app/guardrails/config.get_guardrails_config.
+    mnpi_terms: list[str] = Field(default_factory=list)
+    action: Literal["block", "redact"] = "block"
+
+
+class GuardrailsAgentConfig(BaseModel):
+    """Round-trips through POST/PATCH /api/agents the same way
+    ScilAgentConfig does — this schema existing (not just the free-form
+    dict `model_config_json` column) is what lets a `model_config.guardrails`
+    value survive request validation instead of being silently stripped by
+    ModelConfig's default extra="ignore" behavior. See
+    app/guardrails/config.get_guardrails_config for how the platform default
+    (Settings.guardrails_enabled/guardrails_judge_enabled) layers under
+    whatever this agent explicitly sets."""
+
+    enabled: bool = True
+    input: GuardrailsInputConfig = Field(default_factory=GuardrailsInputConfig)
+    output: GuardrailsOutputConfig = Field(default_factory=GuardrailsOutputConfig)
+    block_message: str | None = None
+
+
 class ModelConfig(BaseModel):
     model: str = "gemini-3.5-flash"
     temperature: float = 0.3
     scil: ScilAgentConfig | None = None
+    guardrails: GuardrailsAgentConfig | None = None
 
 
 class AgentCreate(BaseModel):

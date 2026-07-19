@@ -18,8 +18,11 @@ from app.config_api.data_entities import router as data_entities_router
 from app.config_api.publish_requests import router as publish_requests_router
 from app.config_api.skills import router as skills_router
 from app.config_api.tools import router as tools_router
+from app.config_api.workspace_config import router as workspace_config_router
 from app.dashboards_api.audit import router as audit_router
+from app.dashboards_api.guardrails import router as guardrails_dashboard_router
 from app.dashboards_api.monitoring import router as monitoring_router
+from app.dashboards_api.policy_events import router as policy_events_router
 from app.dashboards_api.retention import router as retention_router
 from app.dashboards_api.usage import router as usage_router
 from app.db import async_session_factory
@@ -66,6 +69,7 @@ app.add_middleware(
 setup_tracing(app)
 
 app.include_router(tools_router, prefix="/api")
+app.include_router(workspace_config_router, prefix="/api")
 app.include_router(access_policies_router, prefix="/api")
 app.include_router(data_entities_router, prefix="/api")
 app.include_router(skills_router, prefix="/api")
@@ -81,6 +85,8 @@ app.include_router(invoke_router, prefix="/api")
 app.include_router(monitoring_router, prefix="/api")
 app.include_router(usage_router, prefix="/api")
 app.include_router(audit_router, prefix="/api")
+app.include_router(guardrails_dashboard_router, prefix="/api")
+app.include_router(policy_events_router, prefix="/api")
 app.include_router(retention_router, prefix="/api")
 app.include_router(debug_router, prefix="/api")
 app.include_router(scil_router, prefix="/api")

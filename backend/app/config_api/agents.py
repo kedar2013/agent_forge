@@ -17,9 +17,10 @@ from app.models.agents import (
     AgentVersion,
 )
 from app.models.skills import Skill
-from app.models.tools import Tool
+from app.models.tools import Tool, ToolGrant
 from app.models.users import User
 from app.principal import Principal, require_role
+from app.tenancy import require_model_allowed
 from app.schemas.agents import (
     AddCollaboratorRequest,
     AgentCreate,
@@ -205,6 +206,7 @@ async def create_agent(
     # payload's free-form value) — this is what ownership scoping in
     # _require_can_modify keys off of, so it can't be spoofed at create time.
     created_by = _actor(principal) if principal.role == "developer" else payload.created_by
+    await require_model_allowed(db, principal.workspace_id, payload.model_settings.model)
     agent = Agent(
         name=payload.name,
         description=payload.description,
@@ -319,6 +321,7 @@ async def update_agent(
     updates = payload.model_dump(exclude_unset=True, by_alias=False)
     model_settings = updates.pop("model_settings", None)
     if model_settings is not None:
+        await require_model_allowed(db, principal.workspace_id, model_settings["model"])
         agent.model_config_json = model_settings
     for key, value in updates.items():
         setattr(agent, key, value)
@@ -370,6 +373,14 @@ async def attach_tool(
     tool = await db.get(Tool, payload.tool_id)
     if tool is None or tool.workspace_id != principal.workspace_id:
         raise HTTPException(status_code=404, detail="Tool not found")
+    if tool.access_scope == "restricted":
+        grant = await db.get(ToolGrant, {"tool_id": tool.id, "agent_id": agent_id})
+        if grant is None:
+            raise HTTPException(
+                status_code=403,
+                detail="This tool is restricted — grant this agent access first "
+                "(POST /tools/{tool_id}/grants) before attaching it.",
+            )
     existing = await db.get(AgentTool, {"agent_id": agent_id, "tool_id": payload.tool_id})
     if existing is None:
         db.add(AgentTool(agent_id=agent_id, tool_id=payload.tool_id))

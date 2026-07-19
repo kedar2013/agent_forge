@@ -1,0 +1,137 @@
+name: Eval quality gate
+
+# Gates a PR on the SCIL golden-question regression suite + System Prompt
+# Evaluator (see backend/scripts/eval_gate.py) instead of letting an agent
+# config or prompt regression merge silently. Runs real LLM calls (the agent
+# under test AND the judge), so it needs GEMINI_API_KEY as a repo secret —
+# Settings -> Secrets and variables -> Actions -> New repository secret.
+#
+# Everything about what gets gated and how strictly is configurable:
+#   - Pull requests always run with this file's `env:` defaults below.
+#   - A manual `workflow_dispatch` run can override the agent scope and
+#     both thresholds without editing the file (see `inputs:`).
+#   - Both defaults are also overridable per-push via repo/environment
+#     variables of the same name (vars.EVAL_GATE_MIN_PASS_RATE etc.), so an
+#     org can tighten the bar without a code change.
+on:
+  pull_request:
+    paths:
+      - "backend/app/**"
+      - "backend/scripts/seed_*.py"
+      - "backend/scripts/eval_gate.py"
+      - "backend/alembic/versions/**"
+  workflow_dispatch:
+    inputs:
+      agents:
+        description: "Space-separated agent names to gate on (blank = every published agent with active eval cases)"
+        required: false
+        default: ""
+      min_pass_rate:
+        description: "Minimum golden-set regression pass rate (0-1)"
+        required: false
+        default: "0.8"
+      min_prompt_score:
+        description: "Minimum System Prompt Evaluator score (0-100)"
+        required: false
+        default: "70"
+
+env:
+  EVAL_GATE_MIN_PASS_RATE: ${{ github.event.inputs.min_pass_rate || vars.EVAL_GATE_MIN_PASS_RATE || '0.8' }}
+  EVAL_GATE_MIN_PROMPT_SCORE: ${{ github.event.inputs.min_prompt_score || vars.EVAL_GATE_MIN_PROMPT_SCORE || '70' }}
+
+jobs:
+  eval-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: agent_forge
+          POSTGRES_PASSWORD: agent_forge
+          POSTGRES_DB: agent_forge
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U agent_forge"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: agent_forge
+          MYSQL_DATABASE: agentic_ai
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -proot"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://agent_forge:agent_forge@localhost:5432/agent_forge
+      DB_SCHEMA: agent_forge
+      ENV: development
+      AGENT_FORGE_API_TOKEN: ci-eval-gate-token-not-a-real-secret
+      USER_TOKEN_SECRET: ci-eval-gate-token-not-a-real-secret
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_PORT: 3306
+      MYSQL_USER: root
+      MYSQL_PASSWORD: agent_forge
+      MYSQL_DATABASE: agentic_ai
+      CREDIT_FACILITY_MYSQL_HOST: 127.0.0.1
+      CREDIT_FACILITY_MYSQL_PORT: 3306
+      CREDIT_FACILITY_MYSQL_USER: root
+      CREDIT_FACILITY_MYSQL_PASSWORD: agent_forge
+      CREDIT_FACILITY_MYSQL_DATABASE: agentic_ai
+      REVENUE_RETURNS_MYSQL_HOST: 127.0.0.1
+      REVENUE_RETURNS_MYSQL_PORT: 3306
+      REVENUE_RETURNS_MYSQL_USER: root
+      REVENUE_RETURNS_MYSQL_PASSWORD: agent_forge
+      REVENUE_RETURNS_MYSQL_DATABASE: agentic_ai
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: pip install -e ".[dev]"
+
+      - name: Run database migrations
+        working-directory: backend
+        run: alembic upgrade head
+
+      - name: Seed demo agents and domain data
+        working-directory: backend
+        run: |
+          python scripts/seed_market_agents.py
+          python -m app.domains.credit_facility.seed_data
+          python -m app.domains.credit_facility.seed_agent
+          python -m app.domains.revenue_and_returns.seed_data
+          python -m app.domains.revenue_and_returns.seed_agent
+          python scripts/seed_eval_cases.py
+
+      - name: Publish agents under evaluation
+        working-directory: backend
+        run: python scripts/publish_agent.py stock_market_analyst credit_facility_analyst revenue_returns_analyst
+
+      - name: Run eval gate
+        working-directory: backend
+        env:
+          EVAL_GATE_AGENTS: ${{ github.event.inputs.agents }}
+        run: |
+          agent_flags=()
+          for name in $EVAL_GATE_AGENTS; do
+            agent_flags+=(--agent "$name")
+          done
+          python scripts/eval_gate.py \
+            --min-pass-rate "$EVAL_GATE_MIN_PASS_RATE" \
+            --min-prompt-score "$EVAL_GATE_MIN_PROMPT_SCORE" \
+            "${agent_flags[@]}"

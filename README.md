@@ -25,8 +25,25 @@ attach a skill, or route between sub-agents.
   specialist actually made it) — works standalone from Postgres, or against
   a real OpenTelemetry trace backend (Jaeger by default, or any OTLP
   endpoint — Tempo, Langfuse, Honeycomb, Datadog, ...) when `OTEL_ENABLED=true`.
-  `docker compose up -d jaeger` brings up a local one in one command. See
-  section 18 of the technical design document.
+  The root `agent.invocation` span carries `llm.model`/`llm.input_tokens`/
+  `llm.output_tokens`/`llm.cost_usd` (the same figures `InvocationLog`
+  persists, now graphable in the trace backend too), and a SCIL template
+  match / semantic-cache hit gets its own zero-LLM-call `scil.cache` span
+  (`scil.route = "deterministic" | "cache_hit"`) instead of being invisible
+  in the trace view. `docker compose up -d jaeger` brings up a local one in
+  one command. See section 18 of the technical design document.
+- **Deterministic replay** (`POST /debug/traces/{invocation_id}/replay`,
+  `app/replay/`) — the "time-travel debugger": re-runs a past invocation's
+  original message with every tool call fed its ORIGINAL recorded output
+  (matched by agent+tool name, in call order) instead of hitting real
+  tools/data again, so a past failure reproduces without depending on live,
+  possibly-since-changed external state. Always rebuilds from the EXACT
+  recorded `agent_versions` snapshot, never the current live/published
+  config. Response includes both the original and replayed answers side by
+  side, plus `matched_tool_call_count`/`total_recorded_tool_call_count` so
+  you can tell a clean replay from one where the trajectory diverged (the
+  prompt/tools changed since the original run). Admin/developer only — it
+  makes a real LLM call, same "spends real tokens" bucket as Playground.
 - `config_api` — CRUD for tools/skills/agents, attach/detach endpoints,
   circular sub-agent detection, publish + versioning
 - `tool_registry` — `http_tool`, `sql_tool`, `mcp_tool`, `image_gen_tool`,
@@ -57,7 +74,7 @@ attach a skill, or route between sub-agents.
 | Capability | Implementation | Generic or domain-bound | Used by |
 |---|---|---|---|
 | Query any table/collection, LLM writes the SQL | `data_query_tool` (`backend/app/tool_registry/data_query_tool.py`) — validates via a real `sqlglot` AST, AST-injects the access policy's predicate | **Generic** — schema + scope come from a `data_entities` row, not code | `credit_facility_analyst` (`query_companies`, `query_facility_data`) |
-| Row-level access control | `access_policies` + `app/tool_registry/policy_engine.py` | **Generic** — persona rules are JSON config, not code | Any `data_query_tool`/`mysql_query_tool`/`mongo_query_tool` that sets `policy_id` |
+| Row-level access control | `access_policies` + `app/tool_registry/policy_engine.py` (or, per-policy, OPA/Rego — see below) | **Generic** — persona rules are JSON config, not code | Any `data_query_tool`/`mysql_query_tool`/`mongo_query_tool` that sets `policy_id` |
 | Data dictionary (columns, labels, format) | `data_entities` (`backend/app/models/data_entities.py`), with MySQL/Mongo introspection | **Generic** | `data_query_tool` instances |
 | Chart image | `generate_chart_tool` (`mcp_servers/chart_server.py`) | **Generic** — arbitrary series in, PNG out | 5 market-intelligence specialists, `reporting_specialist` |
 | Chart-type selection + slide outline | `chart_planner_tool` (`mcp_servers/slide_reporting_server.py`) | **Generic** — pure pandas shape classification on `{columns, data}` | `slide_reporting_agent`, `reporting_specialist` |
@@ -230,11 +247,38 @@ carry; quiz/flashcard output is also supposed to vary between runs).
 Not yet built (SCIL spec remainder): escalation-tier routing to a bigger
 model and HITL escalation.
 
-**Deferred to future sessions:** real OpenTelemetry export + Langfuse,
-versioning diff/rollback UI, per-agent rate limiting beyond what's already
-enforced, multi-tenancy hardening beyond the default workspace, live
+**Deferred to future sessions:** versioning diff/rollback UI, live
 retrieval/pgvector testing outside the StudyBuddy import, and market-news
 sentiment agents (no reliable free/no-key news API was available).
+
+### CI eval gate — golden-set regression + prompt quality
+
+`.github/workflows/eval-gate.yml` + `backend/scripts/eval_gate.py` turn the
+SCIL golden-question regression suite (`POST /api/scil/eval/run`) and the
+System Prompt Evaluator (`POST /api/prompt-eval/evaluate`) into a CI quality
+gate: a PR that regresses trajectory accuracy or prompt quality fails the
+build instead of merging silently. Runs in-process over ASGI (same harness
+`tests/conftest.py` uses) against a real Postgres+MySQL — no separately
+running backend needed, but real LLM calls (the agent under test AND the
+judge), so it needs a `GEMINI_API_KEY` repo secret.
+
+Every threshold and the agent scope are configurable — different agents
+warrant different bars, and a brand-new agent with a thin golden set
+shouldn't be held to the same bar as a mature one:
+
+```bash
+python scripts/eval_gate.py                                              # every published agent with active eval cases
+python scripts/eval_gate.py --min-pass-rate 0.9 --min-prompt-score 75
+python scripts/eval_gate.py --agent credit_facility_analyst --agent revenue_returns_analyst
+EVAL_GATE_MIN_PASS_RATE=0.9 python scripts/eval_gate.py                  # same knobs as env vars, for CI
+```
+
+Runs automatically on any PR touching `backend/app/**`; also runnable by
+hand via `workflow_dispatch` with its own agent-scope/threshold inputs, or
+tuned org-wide without a code change via repo variables
+`EVAL_GATE_MIN_PASS_RATE`/`EVAL_GATE_MIN_PROMPT_SCORE`.
+`backend/scripts/publish_agent.py <name> [<name> ...]` publishes a freshly
+seeded agent so the gate has something published to evaluate.
 
 ### Durable Execution & Reliability
 
@@ -302,6 +346,271 @@ even though the underlying saga didn't actually complete. Same class of
 problem SCIL's hallucination validator exists for; solving it here would
 need a saga-completion check independent of turn status, not just a bigger
 compensation walk.
+
+### Guardrails — input/output policy enforcement
+
+Central `before_model_callback`/`after_model_callback` chain (`app/guardrails/`),
+registered on every agent this platform builds (orchestrator AND every
+specialist — a transfer hop can't bypass it), not per-agent opt-in code.
+Two layers per direction: free deterministic regex checks (always run) and
+an optional LLM-judge escalation (extra cost/latency, off by default — see
+below):
+
+- **Input**: prompt-injection and jailbreak heuristics (`app/guardrails/patterns.py`),
+  plus an optional topical-scope judge per agent.
+- **Output**: PII (SSN, Luhn-checked credit card numbers, email, phone),
+  a configurable MNPI/confidential-term list, and an optional toxicity
+  judge. `action: "block"` replaces the whole response; `action: "redact"`
+  masks just the flagged span and lets the rest through (PII/MNPI only —
+  toxicity always hard-blocks).
+
+Every check is independently configurable, at two layers — a platform
+default (env vars, `app/config.py`: `GUARDRAILS_ENABLED`,
+`GUARDRAILS_JUDGE_ENABLED`, `GUARDRAILS_MNPI_TERMS_RAW`) and a per-agent
+override/opt-out via `model_config.guardrails`:
+
+```json
+"guardrails": {
+  "enabled": true,
+  "input": { "prompt_injection_check": true, "jailbreak_check": true,
+             "topical_scope": "credit facility and lending questions only",
+             "topical_scope_check": false },
+  "output": { "pii_check": true, "mnpi_check": true, "toxicity_check": true,
+              "mnpi_terms": ["project falcon"], "action": "block" }
+}
+```
+
+`GUARDRAILS_JUDGE_ENABLED` (the LLM-judge checks specifically) defaults
+**off**, unlike `GUARDRAILS_ENABLED`: a judge call is a real extra model
+call on every single agent turn (every hop, for a multi-specialist turn) —
+defaulting that on would silently double every already-published agent's
+LLM spend the moment this ships, so it's opt-in the same way SCIL's
+`hallucination_groundedness_check` is.
+
+Every flagged check writes one `guardrail_events` row (`app/models/guardrails.py`)
+synchronously, inside the callback itself — not batched with the rest of a
+turn's logging, so a block is provably recorded even if the rest of the
+turn crashes right after. Admin-visible at `GET /api/dashboards/guardrails/events`.
+
+### Policy-as-code (OPA/Rego)
+
+A second, opt-in phase-2 decision engine for `access_policies`
+(`app/tool_registry/opa_client.py`), alongside the existing in-process
+`policy_engine.apply_policy`. Per-*policy*, not platform-wide: setting
+`resolver_config.engine = "opa"` + `resolver_config.opa_package` on one
+`AccessPolicy` row routes just that policy's allow/deny/filter decision
+through a real OPA server instead of the Python JSON-rules evaluator;
+every policy that doesn't set `engine` is completely unaffected. Scope
+resolution (persona/coverage lookup) is unchanged either way — only the
+"what does this resolved scope + these tool args authorize" step moves.
+
+`backend/policies/` has a worked, fully-tested port of Credit Facility's
+real GCM/GSG/NON_GSG/CCB persona rules — the exact same rule set
+`app.domains.credit_facility.policy_config` already expresses as a Python
+dict, now also expressed as checked-in, independently regression-tested
+Rego (`opa test backend/policies/`, wired into
+`.github/workflows/opa-policy-test.yml` on every PR touching that
+directory). This is the actual point of "policy-as-code" over a JSONB
+`rules` column: a `.rego` file is diffable, reviewable, and testable
+outside the running app in a way a database row isn't.
+
+```bash
+docker compose up -d opa                                                    # local OPA loaded with backend/policies/
+# then in backend/.env: OPA_ENABLED=true, OPA_URL=http://localhost:8181
+python scripts/migrate_policy_to_opa.py credit_facility_query_access credit_facility.query_access
+python scripts/migrate_policy_to_opa.py credit_facility_query_access --revert   # back to the Python engine
+```
+
+`OPA_FAIL_CLOSED` (default `true`) governs what happens if OPA is
+unreachable when a request needs a decision: fail closed (deny — the safe
+default for an access-control gate) or fail open (allow through
+unfiltered, logged loudly, opt-in only for an operator who's deliberately
+chosen availability over that particular fail-safety).
+
+### Audit & lineage
+
+Two pieces, both building on Guardrails/OPA above:
+
+- **`policy_events`** (`app/tool_registry/policy_audit.py`) — every DENIED
+  access_policy decision (either engine), same "only the exception is
+  interesting" convention as `guardrail_events`. Both tables now carry
+  their own independent hash chain (`seq`/`prev_hash`/`row_hash`, see
+  `app/event_chain.py` — the same tamper-evidence property
+  `config_audit_log` already had, generalized to a second/third chain
+  rather than mixing runtime security decisions into that config-change-
+  history table). `GET /dashboards/guardrails/verify-chain` and
+  `GET /dashboards/policy-events/verify-chain` recompute and confirm each
+  one, same shape as the existing `GET /dashboards/audit/verify-chain`.
+- **`GET /debug/traces/{invocation_id}/lineage`** — the audit-ready
+  consolidated view: the final answer, every tool call that grounded it
+  (name/input/output/agent), and every guardrail/policy verdict that fired
+  during that turn. Attribution is at the invocation level (which calls
+  fed this turn), not sentence-level — this platform doesn't attempt to
+  attribute individual claims in the final text to individual tool calls.
+  Joins back via `InvocationLog.adk_invocation_id`, now captured for
+  *every* agent (previously only durable-execution-enabled ones — see
+  `_RunOutcome.adk_invocation_id`'s docstring in `playground_api/router.py`),
+  since that's the same stable id `GuardrailEvent`/`PolicyEvent` are keyed
+  by from the moment they fire, well before `InvocationLog` itself is
+  written.
+
+### Tool registry lifecycle
+
+Four independent, all-opt-in pieces on top of `tools`, none changing
+behavior for a tool that doesn't ask for it:
+
+- **Versioning** (`tool_versions`, mirrors `AgentVersion`'s shape) — every
+  update that touches `config`/`input_schema`/`output_schema`/`description`
+  snapshots a new version (a rename alone doesn't); `GET /tools/{id}/versions`
+  lists history, `POST /tools/{id}/versions/{version}/rollback` restores a
+  past snapshot as the live config — itself recorded as a NEW version
+  (never reusing the old number) so the history stays linear.
+- **Per-agent RBAC** (`Tool.access_scope`: `"workspace"` default — any agent
+  in the tool's own workspace, today's behavior — or `"restricted"` +
+  `tool_grants`) — a restricted tool needs an explicit
+  `POST /tools/{id}/grants {"agent_id": ...}` before
+  `POST /agents/{id}/tools` will attach it (403 otherwise), and the same
+  check runs again at BUILD time (`agent_runtime/builder.py`'s
+  `_tool_authorized_for_agent_clause`) as defense in depth against a grant
+  revoked after attachment or a stale published snapshot.
+- **Egress-controlled sandboxing** (`app/tool_registry/egress.py`) — for
+  `http_tool` specifically (the one tool type making a caller-configured
+  call to an arbitrary host): a per-tool `config.egress_allowlist` or the
+  platform-wide `TOOL_EGRESS_ALLOWLIST_RAW` env var (empty = unrestricted,
+  the default) gates the outbound host before any request is made.
+  Deliberately NOT attempted for MCP servers — those run in their own
+  subprocess, outside this app's process boundary, and need OS-level
+  controls (container network policy, an egress proxy in front of the
+  subprocess) instead.
+- **Output-schema validation** (`Tool.output_schema`, optional, mirrors the
+  existing `input_schema`) — checked on every real response in
+  `agent_runtime/builder.py`'s `_build_after_tool_callback`; a response
+  that fails validation is REPLACED with an error (via ADK's
+  after_tool_callback override mechanism) rather than passed through, so a
+  malformed/misbehaving tool or MCP server can't feed unvalidated shape
+  into the model's context.
+
+### Model cascading
+
+"Cheap model first, escalate on low confidence" (`app/agent_runtime/cascade.py`)
+— wires the previously-dormant `model_config.scil.escalation_model` field
+into SCIL's existing retry loop instead of inventing a parallel confidence
+heuristic: a SCIL validator failure (deterministic check, groundedness
+judge, or entity-resolution mismatch) already IS this platform's "low
+confidence" signal. Once one fires, every retry that turn runs on
+`escalation_model` instead of blindly retrying the same model:
+
+```json
+"scil": { "enabled": true, "validators": ["sql"],
+          "escalation_model": "gemini-2.5-pro",
+          "escalation_max_cost_usd": 0.05 }
+```
+
+- **Cache-safe**: the escalated agent is a `model_copy()` of the built
+  agent with just `.model` swapped — never a mutation of the original,
+  which may be a published, cached instance shared across concurrent
+  requests. Deliberately scoped to leaf agents (no `sub_agents`) — see
+  `build_escalated_agent`'s docstring for why an orchestrator is excluded
+  rather than partially/riskily supported.
+- **Cost budget**: `escalation_max_cost_usd`, if set, estimates the
+  escalation's likely cost from the failed attempt's own token counts (a
+  same-turn proxy, not a guarantee) and skips escalating — keeping the
+  low-confidence answer rather than silently exceeding a per-turn budget —
+  when that estimate exceeds the ceiling.
+- **Cost accounting stays accurate**: the turn's persisted
+  `estimated_cost_usd` reflects whichever model actually produced the
+  final answer, not the original cheap one, when escalation fired (see
+  `_run_turn`'s `final_model_used` tracking) — otherwise every escalated
+  turn would under-report its real cost.
+
+### Multi-tenancy: rate limiting + per-workspace config
+
+Two pieces, both opt-in beyond what already existed (`Tool`/`Agent`/every
+other config row was already workspace-scoped from the multi-tenancy pass
+that added `workspaces` itself):
+
+- **Pluggable rate-limit backend** (`app/rate_limit_backends.py`) — the
+  existing per-process in-memory limiter, extracted unchanged behind a
+  `RateLimitBackend` interface, plus a new Redis-backed one for a
+  multi-instance deployment (an in-memory backend silently gives every
+  process its own separate budget the moment there's more than one — a
+  real correctness gap for a load-balanced deployment, not just a
+  performance one). `RATE_LIMIT_BACKEND=memory` (default) vs `redis` +
+  `REDIS_URL`; `docker compose up -d redis` for a local one. Verified
+  against `fakeredis` (a real in-memory Redis-protocol implementation, not
+  a hand-rolled mock) — a genuine bug (two requests landing in the same
+  `time.time()` tick collapsed into one sorted-set entry, undercounting
+  the window) only surfaced once tested this way.
+- **Per-workspace quota** (`rate_limit_workspace`, layered on top of the
+  existing per-user `rate_limit_principal` on `/chat/message`,
+  `/chat/message/stream`, `/playground/run`, and `/invoke`) — an aggregate
+  budget across every principal in one tenant, catching "this whole
+  workspace is unusually busy" independent of any single user individually
+  staying under their own per-user limit. Default ceiling is
+  `WORKSPACE_MAX_REQUESTS_PER_MINUTE`; `PUT /api/workspace-config` (admin,
+  scoped implicitly to the caller's own workspace — no cross-tenant path
+  param to get wrong) overrides it per-tenant via
+  `max_requests_per_minute`.
+- **Per-workspace allowlists** (`WorkspaceConfig.allowed_models`/
+  `allowed_tool_types`, same `PUT /api/workspace-config`) — NULL (default)
+  means unrestricted; enforced at CONFIG-WRITE time
+  (`config_api/agents.py`/`config_api/tools.py` via `app/tenancy.py`), not
+  agent-build time, since which models/tools a tenant may use is a
+  governance decision made when an admin authors the config, not a
+  per-invocation runtime gate.
+
+A hash-chain integrity bug in `guardrail_events`/`policy_events` (task #6)
+was found and fixed while building this: their `agent_id`/`policy_id`
+columns were real foreign keys with `ON DELETE SET NULL`, which silently
+rewrote an already-hashed field the moment a referenced agent/policy was
+deleted — turning a legitimate cleanup into what `verify_event_chain`
+correctly reported as tampering. Both are now plain UUID columns (same
+soft-reference pattern `config_audit_log.entity_id` already used), since
+an audit trail's rows must never be mutated by something else's delete.
+
+### Temporal-backed durable workflows
+
+A SECOND, heavier-weight durable-execution spine (`app/durable_workflow/`),
+deliberately separate from the existing "Durable Execution & Reliability"
+section above: that one resumes a single crashed CHAT TURN via ADK's own
+resumability + Postgres checkpoints; this one durably orchestrates a
+genuinely long-running, multi-step BUSINESS PROCESS with real side effects
+— able to survive a WORKER PROCESS crash between steps, not just an
+API-request crash. Worked example: the same reservation reserve/confirm/
+release saga `reservation_demo_tool.py`/`app/reliability/compensation.py`
+already prove in-process, ported to a real `ReservationSagaWorkflow`
+Temporal workflow against the same `reliability_demo_inventory` table, so
+the two approaches are directly comparable.
+
+- **Real idempotency keys** (`TemporalReservation`, keyed by the
+  workflow's own `workflow_id`) — Temporal's at-least-once activity
+  execution guarantee means any activity can genuinely run more than once
+  for the same logical step; each activity (`reserve_inventory`,
+  `confirm_order`, `release_inventory`) checks this table first rather
+  than blindly re-applying its DB mutation on retry.
+- **Saga/compensation, Temporal-native**: `confirm_order` deliberately
+  isn't retried (a `FORCE_FAIL` order id is a business decline, not a
+  transient blip — see its docstring); the workflow catches that failure
+  and calls `release_inventory` (compensation) before re-raising, so the
+  workflow itself reports failed/compensated rather than silently
+  swallowing it.
+- **Off by default, a genuinely separate opt-in** from OPA/Redis: needs
+  the `temporal` extra (`pip install -e ".[temporal]"` — `temporalio` is a
+  heavy binary wheel, not bundled into the base install) AND
+  `TEMPORAL_ENABLED=true` AND a real Temporal server
+  (`docker compose up -d temporal`, reusing this repo's own `postgres`
+  service for persistence) AND a running worker
+  (`python scripts/run_temporal_worker.py`, a separate process from the
+  API server — the API only ever STARTS a workflow via
+  `POST /api/reliability/temporal/reservations`, never executes one).
+  Every import here is lazy — `app.main` never touches `temporalio` at
+  all, so a checkout that never opts in doesn't need it installed.
+- **Tested against a real local Temporal dev server**
+  (`temporalio.testing.WorkflowEnvironment.start_local()`, which downloads
+  and runs an actual ephemeral server binary — not a mock), covering the
+  confirm/compensate/insufficient-inventory paths and idempotency
+  directly; `tests/test_temporal_workflow.py` skips itself gracefully via
+  `pytest.importorskip` when the `temporal` extra isn't installed.
 
 ### Single orchestrator & Planner/ReAct
 

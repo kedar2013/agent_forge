@@ -20,7 +20,7 @@ from app.models.agents import AgentSubagent
 from app.models.logs import InvocationLog
 from app.playground_api.router import _run_turn, _stream_turn
 from app.principal import Principal
-from app.rate_limit import rate_limit_principal
+from app.rate_limit import rate_limit_workspace
 from app.reliability.durable_execution_config import get_durable_execution_config
 from app.schemas.dashboards import MyUsageAgentRow, MyUsageDayPoint, MyUsageSummary
 from app.schemas.playground import PlaygroundRunResponse
@@ -175,7 +175,7 @@ def _identity_state_delta(principal: Principal) -> dict[str, Any]:
     }
 
 
-@router.post("/message", response_model=PlaygroundRunResponse, dependencies=[Depends(rate_limit_principal)])
+@router.post("/message", response_model=PlaygroundRunResponse, dependencies=[Depends(rate_limit_workspace)])
 async def send_chat_message(
     payload: ChatMessageRequest,
     principal: Principal = Depends(require_chat_access),
@@ -219,7 +219,7 @@ async def send_chat_message(
         )
 
 
-@router.post("/message/stream", dependencies=[Depends(rate_limit_principal)])
+@router.post("/message/stream", dependencies=[Depends(rate_limit_workspace)])
 async def send_chat_message_stream(
     payload: ChatMessageRequest,
     principal: Principal = Depends(require_chat_access),

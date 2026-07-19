@@ -6,6 +6,7 @@ import httpx
 
 from app.reliability.resilient_call import resilient_call
 from app.tool_registry.base import ConfigDrivenTool
+from app.tool_registry.egress import check_egress_allowed
 
 _PATH_PARAM_RE = re.compile(r"\{(\w+)\}")
 
@@ -50,6 +51,10 @@ class HttpTool(ConfigDrivenTool):
         path_values = {p: args[p] for p in path_params if p in args}
         path = path_template.format(**path_values)
         url = config["base_url"].rstrip("/") + path
+
+        denial_reason = check_egress_allowed(url, config)
+        if denial_reason:
+            return {"error": denial_reason}
 
         remaining = {k: v for k, v in args.items() if k not in path_params}
         method = config.get("method", "GET").upper()

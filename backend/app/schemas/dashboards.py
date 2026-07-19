@@ -135,6 +135,45 @@ class InvocationListResponse(BaseModel):
     offset: int
 
 
+class GuardrailEventRow(BaseModel):
+    id: uuid.UUID
+    agent_id: uuid.UUID | None
+    agent_name: str | None
+    adk_invocation_id: str | None
+    direction: str
+    check_name: str
+    action: str
+    reason: str | None
+    created_at: datetime
+
+
+class GuardrailEventListResponse(BaseModel):
+    items: list[GuardrailEventRow]
+    total: int
+    limit: int
+    offset: int
+
+
+class PolicyEventRow(BaseModel):
+    id: uuid.UUID
+    agent_id: uuid.UUID | None
+    agent_name: str | None
+    adk_invocation_id: str | None
+    tool_name: str
+    policy_id: uuid.UUID | None
+    engine: str
+    persona: str | None
+    reason: str | None
+    created_at: datetime
+
+
+class PolicyEventListResponse(BaseModel):
+    items: list[PolicyEventRow]
+    total: int
+    limit: int
+    offset: int
+
+
 class ConfigChangeListResponse(BaseModel):
     items: list[ConfigAuditRow]
     total: int

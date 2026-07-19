@@ -37,11 +37,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.agents import Agent
 from app.db import get_db
+from app.models.guardrails import GuardrailEvent, PolicyEvent
 from app.models.logs import AgentEventLog, InvocationLog, ToolCallLog
 from app.models.tools import Tool
 from app.observability.rca import RCA_SUGGESTIONS
 from app.principal import Principal, require_role
-from app.schemas.debug import RcaInfo, SpanNode, TraceDetail, TraceListResponse, TraceSummary
+from app.replay.service import ReplayError, replay_invocation
+from app.schemas.debug import (
+    LineageGuardrailEvent,
+    LineagePolicyEvent,
+    LineageResponse,
+    LineageToolCall,
+    RcaInfo,
+    ReplayResponse,
+    ReplayToolCall,
+    SpanNode,
+    TraceDetail,
+    TraceListResponse,
+    TraceSummary,
+)
 
 router = APIRouter(prefix="/debug", tags=["debug"])
 
@@ -402,4 +416,120 @@ async def get_trace(
         spans=spans,
         spans_source=spans_source,
         jaeger_trace_url=jaeger_trace_url,
+    )
+
+
+@router.post("/traces/{invocation_id}/replay", response_model=ReplayResponse)
+async def replay_trace(
+    invocation_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_role("admin", "developer")),
+) -> ReplayResponse:
+    """Deterministic replay (see app/replay/service.py) — re-runs this
+    invocation's original message with every tool call fed its ORIGINAL
+    recorded output instead of hitting real tools/data again. Not open to
+    "viewer": unlike the read-only trace views above, this makes a real LLM
+    call and spends real tokens, same "build/test" bucket as Playground and
+    the SCIL eval suite (see prompt_eval_api's identical reasoning)."""
+    # _get_invocation_scoped both authorizes (workspace + developer-owns-
+    # agent-or-invocation) and 404s a nonexistent/foreign invocation_id,
+    # same as GET /traces/{id} above -- replay reuses it rather than
+    # re-deriving its own, subtly different auth check.
+    await _get_invocation_scoped(db, invocation_id, principal)
+    try:
+        result = await replay_invocation(db, invocation_id, principal.workspace_id)
+    except ReplayError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return ReplayResponse(
+        invocation_id=result.invocation_id,
+        original_response_text=result.original_response_text,
+        original_status=result.original_status,
+        replayed_response_text=result.replayed_response_text,
+        replayed_status=result.replayed_status,
+        replayed_error_message=result.replayed_error_message,
+        replayed_tool_calls=[ReplayToolCall(**tc) for tc in result.replayed_tool_calls],
+        replayed_input_tokens=result.replayed_input_tokens,
+        replayed_output_tokens=result.replayed_output_tokens,
+        replayed_estimated_cost_usd=result.replayed_estimated_cost_usd,
+        matched_tool_call_count=result.matched_tool_call_count,
+        total_recorded_tool_call_count=result.total_recorded_tool_call_count,
+    )
+
+
+@router.get("/traces/{invocation_id}/lineage", response_model=LineageResponse)
+async def get_lineage(
+    invocation_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_role("admin", "viewer", "developer")),
+) -> LineageResponse:
+    """What grounded this answer (every tool call this turn made) and what
+    governance decisions applied to it (guardrail blocks/redactions, policy
+    denials) — the audit-ready consolidated view GET /traces/{id} doesn't
+    give you (that one renders a waterfall for debugging; this answers "can
+    I prove what this answer was based on and what checks it went through"
+    for a compliance reviewer). Joins GuardrailEvent/PolicyEvent back to
+    this invocation via `adk_invocation_id` (see InvocationLog.
+    adk_invocation_id's docstring — captured for every agent, not just
+    durable-execution ones) — an invocation from before this join key was
+    added has no adk_invocation_id and so shows no governance events here,
+    even if some fired; its tool-call lineage is unaffected either way."""
+    inv, agent_name = await _get_invocation_scoped(db, invocation_id, principal)
+
+    tool_call_rows = (
+        await db.execute(
+            select(ToolCallLog, Tool.name)
+            .outerjoin(Tool, Tool.id == ToolCallLog.tool_id)
+            .where(ToolCallLog.invocation_id == inv.id)
+            .order_by(ToolCallLog.call_index.asc().nulls_last(), ToolCallLog.created_at.asc())
+        )
+    ).all()
+    grounding_tool_calls = [
+        LineageToolCall(
+            name=tool_name or "unknown_tool",
+            agent_name=call.agent_name,
+            status="error" if call.status != "success" else "success",
+            input=call.input,
+            output=call.output,
+        )
+        for call, tool_name in tool_call_rows
+    ]
+
+    guardrail_events: list[LineageGuardrailEvent] = []
+    policy_events: list[LineagePolicyEvent] = []
+    if inv.adk_invocation_id:
+        guardrail_rows = (
+            await db.execute(
+                select(GuardrailEvent)
+                .where(GuardrailEvent.adk_invocation_id == inv.adk_invocation_id)
+                .order_by(GuardrailEvent.seq.asc())
+            )
+        ).scalars()
+        guardrail_events = [
+            LineageGuardrailEvent(
+                direction=row.direction, check_name=row.check_name, action=row.action, reason=row.reason
+            )
+            for row in guardrail_rows
+        ]
+
+        policy_rows = (
+            await db.execute(
+                select(PolicyEvent)
+                .where(PolicyEvent.adk_invocation_id == inv.adk_invocation_id)
+                .order_by(PolicyEvent.seq.asc())
+            )
+        ).scalars()
+        policy_events = [
+            LineagePolicyEvent(tool_name=row.tool_name, engine=row.engine, persona=row.persona, reason=row.reason)
+            for row in policy_rows
+        ]
+
+    return LineageResponse(
+        invocation_id=inv.id,
+        agent_name=agent_name,
+        message=(inv.transcript or {}).get("message") if inv.transcript else None,
+        response_text=(inv.transcript or {}).get("response_text") if inv.transcript else None,
+        grounding_tool_calls=grounding_tool_calls,
+        guardrail_events=guardrail_events,
+        policy_events=policy_events,
     )

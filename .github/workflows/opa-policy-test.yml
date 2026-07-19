@@ -1,0 +1,29 @@
+name: OPA policy tests
+
+# Runs `opa test` over backend/policies/ -- the regression suite for the
+# policy-as-code AccessPolicy engine (see backend/app/tool_registry/
+# opa_client.py). Cheap and fast (no DB, no LLM calls), so this runs on
+# every PR touching the policy bundle, not gated behind a manual trigger
+# the way the (LLM-cost-incurring) eval-gate workflow is.
+on:
+  pull_request:
+    paths:
+      - "backend/policies/**"
+  workflow_dispatch: {}
+
+jobs:
+  opa-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OPA
+        run: |
+          curl -L -o opa https://openpolicyagent.org/downloads/v0.68.0/opa_linux_amd64_static
+          chmod +x opa
+          sudo mv opa /usr/local/bin/opa
+          opa version
+
+      - name: opa test backend/policies/
+        run: opa test backend/policies/ -v

@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent_runtime.builder import get_or_build_agent
 from app.agent_runtime.byok import required_providers, resolve_request_api_keys, use_api_keys
 from app.chat_api.router import _chat_sessions
+from app.config import get_settings
 from app.db import get_db
 from app.logging_hooks import log_invocation_fire_and_forget
 from app.models.agents import Agent
@@ -35,6 +36,8 @@ from app.schemas.reliability import (
     DurableRunEntry,
     DurableRunListResponse,
     DurableRunResumeResponse,
+    TemporalReservationRequest,
+    TemporalReservationResponse,
 )
 
 router = APIRouter(prefix="/reliability", tags=["reliability"])
@@ -202,3 +205,50 @@ async def resume_durable_run(
     return DurableRunResumeResponse(
         id=invocation.id, status=outcome.status, response_text=response_text, error_message=outcome.error_message
     )
+
+
+@router.post("/temporal/reservations", response_model=TemporalReservationResponse)
+async def start_reservation_saga(
+    payload: TemporalReservationRequest,
+    principal: Principal = Depends(require_role("admin", "developer")),
+) -> TemporalReservationResponse:
+    """Starts app.durable_workflow.workflows.ReservationSagaWorkflow and
+    waits for it to finish — the Temporal-backed twin of
+    reservation_demo_tool's in-process reserve/confirm/release, proving
+    the same saga/compensation guarantee now survives a WORKER process
+    crash between steps, not just an API-request one. Requires
+    TEMPORAL_ENABLED=true and a real Temporal server/worker reachable
+    (`docker compose up -d temporal`, `python scripts/run_temporal_worker.py`)
+    — 503 with a clear message otherwise, same "off by default, doesn't
+    need extra infra to boot" pattern as OPA/Jaeger, not a hard crash at
+    import time (see app/durable_workflow/__init__.py's docstring for why
+    every import here is deliberately lazy)."""
+    settings = get_settings()
+    if not settings.temporal_enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="Temporal is not enabled on this server (TEMPORAL_ENABLED=false).",
+        )
+
+    try:
+        from app.durable_workflow.client import get_temporal_client
+        from app.durable_workflow.workflows import ReservationSagaInput, ReservationSagaWorkflow
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Temporal support is not installed (pip install -e '.[temporal]'): {exc}",
+        ) from exc
+
+    workflow_id = f"reservation-{uuid.uuid4()}"
+    try:
+        client = await get_temporal_client()
+        result = await client.execute_workflow(
+            ReservationSagaWorkflow.run,
+            ReservationSagaInput(item=payload.item, quantity=payload.quantity, order_id=payload.order_id),
+            id=workflow_id,
+            task_queue=settings.temporal_task_queue,
+        )
+    except Exception as exc:  # noqa: BLE001 — surfaced as a clear 502, not a raw traceback
+        raise HTTPException(status_code=502, detail=f"Temporal workflow failed to run: {exc}") from exc
+
+    return TemporalReservationResponse(workflow_id=result.reservation_id, status=result.status, detail=result.detail)

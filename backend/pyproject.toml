@@ -79,12 +79,31 @@ dependencies = [
     # click 8.1.8 (pulled in by uvicorn) before this floor was added.
     "aiohttp>=3.14.1",
     "click>=8.3.3",
+    # Opt-in shared rate-limit store for a multi-instance deployment (see
+    # app/rate_limit_backends.RedisBackend) -- always installed (same
+    # "always present, feature gated by config" convention as the
+    # opentelemetry-* packages above), only actually connected to when
+    # RATE_LIMIT_BACKEND=redis is set.
+    "redis>=5.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.2.0",
     "pytest-asyncio>=0.23.0",
+    # In-memory Redis-protocol test double for RedisBackend's test suite --
+    # never imported by app code itself, dev/test only.
+    "fakeredis>=2.20.0",
+]
+# A genuinely separate extra (not folded into `dev`) -- temporalio is a
+# heavy binary wheel and a real Temporal server is a whole extra service
+# (see docker-compose.yml's `temporal`), not something every dev checkout
+# needs just to run the rest of the test suite. tests/test_temporal_
+# workflow.py skips itself gracefully (pytest.importorskip) when this
+# extra isn't installed, so `pip install -e ".[dev]"` alone still runs
+# everything else clean.
+temporal = [
+    "temporalio>=1.8.0",
 ]
 
 [tool.pytest.ini_options]

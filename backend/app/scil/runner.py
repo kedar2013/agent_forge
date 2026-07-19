@@ -41,9 +41,20 @@ class ScilConfig:
     cache_scope: str = "global"
     max_retries: int = 2
     exemplar_top_k: int = 3
-    # Accepted so agent configs can carry the full spec shape without
-    # validation errors; unused until an escalation tier exists.
+    # Model cascading (see app/agent_runtime/cascade.py): once a validator
+    # flags a low-confidence first attempt, every retry this turn runs on
+    # `escalation_model` instead of blindly retrying the same one — the
+    # "escalate on low confidence" half of cheap-model-first cascading.
+    # None (default) = no cascading, retries stay on the original model,
+    # exactly today's behavior.
     escalation_model: str | None = None
+    # The "cost budget" half: if set, an escalation whose ESTIMATED cost
+    # (using the failed attempt's own token counts as a same-turn proxy for
+    # what the bigger model would likely cost) would exceed this ceiling is
+    # skipped — the turn keeps its low-confidence answer rather than
+    # silently blowing a per-turn budget to chase a fix. None (default) =
+    # no ceiling, escalate whenever escalation_model is set.
+    escalation_max_cost_usd: float | None = None
     validators: list[str] = field(default_factory=list)
     templates_enabled: bool = False
     templates: list[dict] = field(default_factory=list)
@@ -74,6 +85,7 @@ def get_scil_config(agent_row: Any) -> ScilConfig:
         max_retries=int(raw.get("max_retries", 2)),
         exemplar_top_k=int(raw.get("exemplar_top_k", 3)),
         escalation_model=raw.get("escalation_model"),
+        escalation_max_cost_usd=raw.get("escalation_max_cost_usd"),
         validators=list(raw.get("validators", [])),
         templates_enabled=bool(raw.get("templates_enabled", False)),
         templates=list(raw.get("templates", [])),

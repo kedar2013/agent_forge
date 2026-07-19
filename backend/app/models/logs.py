@@ -71,15 +71,22 @@ class InvocationLog(Base):
     # invocation, distinct from `trace_id` above (which is the ADK session_id)
     # — this is what correlates a row here to a trace in Jaeger/Langfuse/etc.
     otel_trace_id: Mapped[str | None] = mapped_column(String, nullable=True)
-    # The three columns below are only populated for durable-execution-enabled
-    # agents (model_config.durable_execution.enabled) — NULL for every other
-    # agent, exactly preserving today's behavior for the common case.
-    # adk_invocation_id is the ADK invocation id of whichever attempt is
-    # CURRENTLY live (the initial attempt, or the most recent SCIL retry) —
-    # overwritten on each retry, so it always points at the one to resume if
-    # the process dies. adk_session_id/adk_user_id are what a resume needs to
-    # call runner.run_async(user_id=..., session_id=..., invocation_id=...,
-    # new_message=None) against the same ADK session.
+    # adk_session_id/adk_user_id are only populated for durable-execution-
+    # enabled agents (model_config.durable_execution.enabled) — NULL for
+    # every other agent — since their only purpose is a resume's
+    # runner.run_async(user_id=..., session_id=..., invocation_id=...,
+    # new_message=None) call against the same ADK session.
+    #
+    # adk_invocation_id is different: captured for EVERY agent now (see
+    # _RunOutcome.adk_invocation_id in playground_api/router.py), not just
+    # durable ones — it's ADK's own per-run id, always assigned regardless
+    # of durable_execution, and it's the join key GuardrailEvent/PolicyEvent
+    # (see app/models/guardrails.py) use to correlate back to this row for
+    # GET /debug/traces/{id}/lineage. For a durable turn specifically it's
+    # ALSO the id of whichever attempt is CURRENTLY live (the initial
+    # attempt, or the most recent SCIL retry) — overwritten on each retry
+    # via set_durable_attempt, so it always points at the one to resume if
+    # the process dies; for a non-durable turn it's simply set once.
     adk_invocation_id: Mapped[str | None] = mapped_column(String, nullable=True)
     adk_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
     adk_user_id: Mapped[str | None] = mapped_column(String, nullable=True)
